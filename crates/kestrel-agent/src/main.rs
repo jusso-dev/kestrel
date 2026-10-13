@@ -1,3 +1,6 @@
 fn main() {
-    println!("kestrel-agent {} (skeleton)", env!("CARGO_PKG_VERSION"));
+    if let Err(err) = kestrel_agent::run() {
+        eprintln!("kestrel-agent: {err}");
+        std::process::exit(1);
+    }
 }

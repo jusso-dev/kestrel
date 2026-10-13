@@ -1,3 +1,6 @@
 fn main() {
-    println!("kestrel-server {} (skeleton)", env!("CARGO_PKG_VERSION"));
+    if let Err(err) = kestrel_server::run() {
+        eprintln!("kestrel-server: {err}");
+        std::process::exit(1);
+    }
 }

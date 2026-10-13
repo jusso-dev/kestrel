@@ -1,0 +1,8 @@
+server_url = "https://127.0.0.1:8080"
+data_dir = "deploy/dev/data/agent"
+interval_s = 30
+buffer_max_mb = 256
+allow_remote_commands = false
+
+[labels]
+env = "dev"

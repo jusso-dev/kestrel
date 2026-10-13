@@ -1,0 +1,36 @@
+# Local development stack. The database password is the dev default only.
+# Do not reuse this file as a production deployment.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: kestrel
+      POSTGRES_PASSWORD: kestrel
+      POSTGRES_DB: kestrel
+    ports:
+      - "5432:5432"
+    volumes:
+      - kestrel-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestrel -d kestrel"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  victoria:
+    image: victoriametrics/victoria-metrics:latest
+    command:
+      - "-retentionPeriod=30d"
+      - "-httpListenAddr=:8428"
+    ports:
+      - "8428:8428"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+volumes:
+  kestrel-pg:
