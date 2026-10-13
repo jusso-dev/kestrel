@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod ca;
 pub mod config;
+pub mod db;
 mod http;
 mod perms;
 mod store;
@@ -31,9 +32,12 @@ pub fn run() -> Result<(), ServerError> {
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        let db = db::Db::connect(&cfg.database_url).await?;
+        tracing::info!("database migrations applied");
         let server = start(cfg).await?;
         tokio::signal::ctrl_c().await?;
         server.shutdown();
+        drop(db);
         Ok(())
     })
 }
