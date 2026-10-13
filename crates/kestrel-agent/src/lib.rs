@@ -2,6 +2,8 @@
 
 pub mod buffer;
 pub mod config;
+pub mod identity;
+mod perms;
 pub mod scheduler;
 pub mod shipper;
 
@@ -39,7 +41,12 @@ pub fn run() -> Result<(), AgentError> {
 
 async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let agent_id = load_or_create_agent_id(&cfg.data_dir)?;
+    let identity = identity::ensure(&cfg).await?;
+    let agent_id = if let Some(id) = &identity {
+        id.agent_id.clone()
+    } else {
+        load_or_create_agent_id(&cfg.data_dir)?
+    };
     let max_bytes = cfg.buffer_max_mb.saturating_mul(1024).saturating_mul(1024);
     let buffer = Arc::new(Mutex::new(Buffer::open(
         cfg.data_dir.join("buffer"),
@@ -59,9 +66,14 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
 
     let ship_buffer = Arc::clone(&buffer);
     let ship_shutdown = shutdown_rx.clone();
-    let shipper_client = Shipper::new(&cfg.server_url)?;
-    let shipper = tokio::spawn(async move {
-        shipper_client
+    let shipper = match &identity {
+        Some(id) => Shipper::with_identity(&cfg.server_url, &id.client_identity())?,
+        None => Shipper::new(&cfg.server_url)?,
+    };
+    let shipper = Arc::new(shipper);
+    let shipper_task_client = Arc::clone(&shipper);
+    let shipper_task = tokio::spawn(async move {
+        shipper_task_client
             .run(
                 ship_buffer,
                 ship_shutdown,
@@ -69,6 +81,35 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
                 sample_jitter,
             )
             .await;
+    });
+    let renew_task = identity.as_ref().map(|_| {
+        let renew_dir = cfg.data_dir.clone();
+        let renew_url = cfg.server_url.clone();
+        let renew_shipper = Arc::clone(&shipper);
+        let mut renew_shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(60 * 60));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = renew_shutdown.changed() => break,
+                    _ = ticker.tick() => match identity::refresh(&renew_dir, &renew_url).await {
+                        Ok(Some(updated)) => match shipper::mtls_client(&updated.client_identity()) {
+                            Ok(client) => renew_shipper.replace_client(client),
+                            Err(err) => {
+                                tracing::warn!(error = %err, "renewed certificate could not be loaded");
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(error = %err, "certificate renewal check failed");
+                        }
+                    },
+                }
+            }
+        })
     });
 
     let sync_buffer = Arc::clone(&buffer);
@@ -93,7 +134,10 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
     tokio::signal::ctrl_c().await?;
     let _ = shutdown_tx.send(true);
     let _ = batcher.await;
-    let _ = shipper.await;
+    let _ = shipper_task.await;
+    if let Some(task) = renew_task {
+        let _ = task.await;
+    }
     let _ = syncer.await;
     let mut guard = buffer.lock().unwrap_or_else(|err| err.into_inner());
     guard.sync()?;
@@ -161,6 +205,14 @@ impl From<std::io::Error> for AgentError {
 
 impl From<shipper::ShipError> for AgentError {
     fn from(err: shipper::ShipError) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<identity::IdentityError> for AgentError {
+    fn from(err: identity::IdentityError) -> Self {
         Self {
             message: err.to_string(),
         }

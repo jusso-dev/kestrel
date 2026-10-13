@@ -17,9 +17,16 @@ const IDLE_POLL: Duration = Duration::from_millis(200);
 const BACKOFF_BASE_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 5 * 60 * 1_000;
 
+/// PEM material for an enrolled agent.
+pub struct ClientIdentity {
+    pub cert_pem: String,
+    pub key_pem: String,
+    pub ca_pem: String,
+}
+
 /// HTTP client that posts batches in buffer order.
 pub struct Shipper {
-    client: reqwest::Client,
+    client: Arc<Mutex<reqwest::Client>>,
     ingest_url: Url,
 }
 
@@ -48,15 +55,23 @@ impl ShipError {
 impl Shipper {
     /// POST batches to `{server_url}/api/v1/ingest`.
     pub fn new(server_url: &Url) -> Result<Self, ShipError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| ShipError::new(err.to_string()))?;
         Ok(Self {
-            client,
+            client: Arc::new(Mutex::new(plain_client()?)),
             ingest_url: ingest_url(server_url)?,
         })
+    }
+
+    /// POST batches with a client certificate and the server's CA.
+    pub fn with_identity(server_url: &Url, identity: &ClientIdentity) -> Result<Self, ShipError> {
+        Ok(Self {
+            client: Arc::new(Mutex::new(mtls_client(identity)?)),
+            ingest_url: ingest_url(server_url)?,
+        })
+    }
+
+    /// Swap the HTTP client after a certificate renewal.
+    pub fn replace_client(&self, client: reqwest::Client) {
+        *self.client.lock().unwrap_or_else(|err| err.into_inner()) = client;
     }
 
     /// Ship until `shutdown` is set. `sleep` waits out a backoff.
@@ -149,9 +164,21 @@ impl Shipper {
         }
     }
 
+    /// POST one body. `2xx` is success; the caller decides what to do with other statuses.
+    pub async fn post_bytes(&self, bytes: Vec<u8>) -> Result<u16, ShipError> {
+        self.post(bytes)
+            .await
+            .map(|status| status.as_u16())
+            .map_err(|err| ShipError::new(err.to_string()))
+    }
+
     async fn post(&self, bytes: Vec<u8>) -> Result<StatusCode, reqwest::Error> {
-        let response = self
+        let client = self
             .client
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let response = client
             .post(self.ingest_url.clone())
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(bytes)
@@ -159,6 +186,35 @@ impl Shipper {
             .await?;
         Ok(response.status())
     }
+}
+
+fn plain_client() -> Result<reqwest::Client, ShipError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| ShipError::new(err.to_string()))
+}
+
+/// Build a rustls client that presents `identity` and trusts its CA.
+pub fn mtls_client(identity: &ClientIdentity) -> Result<reqwest::Client, ShipError> {
+    let mut bundle = identity.cert_pem.clone();
+    if !bundle.ends_with('\n') {
+        bundle.push('\n');
+    }
+    bundle.push_str(&identity.key_pem);
+    let tls_identity = reqwest::Identity::from_pem(bundle.as_bytes())
+        .map_err(|err| ShipError::new(err.to_string()))?;
+    let ca = reqwest::Certificate::from_pem(identity.ca_pem.as_bytes())
+        .map_err(|err| ShipError::new(err.to_string()))?;
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .use_rustls_tls()
+        .identity(tls_identity)
+        .add_root_certificate(ca)
+        .build()
+        .map_err(|err| ShipError::new(err.to_string()))
 }
 
 enum Action {
