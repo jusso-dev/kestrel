@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kestrel-proto",
+    "crates/kestrel-agent",
+    "crates/kestrel-server",
+    "crates/kestrel-checks",
+    "crates/kestrel-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/jusso-dev/kestrel"
+rust-version = "1.80"

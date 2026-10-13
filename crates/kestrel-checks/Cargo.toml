@@ -1,0 +1,8 @@
+[package]
+name = "kestrel-checks"
+description = "Built-in collectors and check runners for the Kestrel agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
