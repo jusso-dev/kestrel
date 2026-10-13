@@ -40,6 +40,10 @@ included. Zero-sized mounts are skipped.
 | `kestrel_uptime_seconds` | gauge | yes | yes | yes |
 | `kestrel_agent_memory_bytes` | gauge | yes | yes | yes |
 | `kestrel_agent_cpu_usage_ratio` | gauge | yes | yes | yes |
+| `kestrel_process_count` | gauge | yes | yes | yes |
+| `kestrel_process_cpu_ratio` | gauge | yes | yes | yes |
+| `kestrel_process_memory_bytes` | gauge | yes | yes | yes |
+| `kestrel_service_up` | gauge | yes, systemd | yes, SCM | yes, launchd |
 
 Load averages are a Unix interface. sysinfo 0.32 does not expose per-disk byte
 counters. Linux reads `/proc/diskstats` (the kernel counts 512-byte sectors).
@@ -123,3 +127,34 @@ Example: `kestrel_network_receive_bytes_total{iface="eth0"}`.
 | `kestrel_agent_cpu_usage_ratio` | ratio | none |
 
 These describe the process that is running the collectors.
+
+## Processes
+
+`ProcessCollector` is separate from the always-on host collectors. It groups
+processes by name and publishes the busiest ones.
+
+| Metric | Unit | Labels |
+|---|---|---|
+| `kestrel_process_count` | processes | `name` |
+| `kestrel_process_cpu_ratio` | ratio | `name`, `pid` |
+| `kestrel_process_memory_bytes` | bytes | `name`, `pid` |
+
+`kestrel_process_count` is how many processes share that name. A collector
+built with a configured name list also emits `0` when none of them are
+running. The CPU and memory series are the top 10 processes on the host, not
+only the configured names. `1.0` is 100 percent of one CPU, and the value can
+exceed 1. The first CPU sample after a process start can be `0`.
+
+## Services
+
+`kestrel_service_up{name}` is `1` when the named service is running and `0`
+when it is stopped or not installed. The collector reads the live state on
+every tick, so a stop shows up on the next interval.
+
+| Platform | Source |
+|---|---|
+| Linux | systemd `ActiveState` of `active`, via the system bus. A name with no dot gets a `.service` suffix. |
+| Windows | Service Control Manager state `Running`. |
+| macOS | `launchctl print system/<name>` reports `state = running`. |
+
+Windows Event Log and journald are not collected.
