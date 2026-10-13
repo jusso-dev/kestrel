@@ -1,0 +1,105 @@
+syntax = "proto3";
+
+package kestrel.v1;
+
+// Label is one name/value pair attached to a sample, log line or inventory row.
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+// Sample is one metric observation. Counters use a `_total` suffix and are
+// monotonically increasing; the server computes rates.
+message Sample {
+  string name = 1;
+  repeated Label labels = 2;
+  double value = 3;
+  int64 timestamp_ms = 4;
+}
+
+// CheckResult is the outcome of one Nagios-compatible check.
+// `state` uses the Nagios exit codes: 0 ok, 1 warning, 2 critical, 3 unknown.
+message CheckResult {
+  string check_id = 1;
+  int32 state = 2;
+  string output = 3;
+  string perfdata = 4;
+  int64 timestamp_ms = 5;
+}
+
+// LogEvent is one tailed log line.
+message LogEvent {
+  string source = 1;
+  string line = 2;
+  int64 timestamp_ms = 3;
+  repeated Label labels = 4;
+}
+
+// Filesystem is one mounted filesystem reported in an inventory.
+message Filesystem {
+  string mount = 1;
+  string device = 2;
+  string fs_type = 3;
+}
+
+// NetInterface is one network interface reported in an inventory.
+message NetInterface {
+  string name = 1;
+  string mac = 2;
+  repeated string addresses = 3;
+}
+
+// ListenPort is one listening socket reported in an inventory.
+message ListenPort {
+  string address = 1;
+  uint32 port = 2;
+  string protocol = 3;
+}
+
+// Service is one host service reported in an inventory.
+message Service {
+  string name = 1;
+  string manager = 2;
+  string state = 3;
+}
+
+// Inventory is a point-in-time view of discovered host entities.
+message Inventory {
+  repeated Filesystem filesystems = 1;
+  repeated NetInterface interfaces = 2;
+  repeated ListenPort listen_ports = 3;
+  repeated Service services = 4;
+}
+
+// Batch is one agent push. `seq` is per-agent and strictly increasing so the
+// server can drop duplicates after an at-least-once retry.
+message Batch {
+  string agent_id = 1;
+  uint64 seq = 2;
+  repeated Sample samples = 3;
+  repeated CheckResult checks = 4;
+  repeated LogEvent logs = 5;
+  Inventory inventory = 6;
+}
+
+// CheckSpec tells the agent to run one plugin or script.
+message CheckSpec {
+  string id = 1;
+  repeated string command = 2;
+  uint32 interval_s = 3;
+  uint32 timeout_s = 4;
+}
+
+// LogSpec tells the agent to tail one file.
+message LogSpec {
+  string path = 1;
+  string pattern = 2;
+}
+
+// AgentConfig is the desired collection config returned by the server.
+message AgentConfig {
+  uint32 interval_s = 1;
+  repeated CheckSpec checks = 2;
+  repeated LogSpec logs = 3;
+  string etag = 4;
+}

@@ -6,3 +6,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+prost = "0.13"
+zstd = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
