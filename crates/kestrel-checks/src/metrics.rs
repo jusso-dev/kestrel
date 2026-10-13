@@ -24,6 +24,7 @@ pub const NETWORK_TRANSMIT_ERRORS_TOTAL: &str = "kestrel_network_transmit_errors
 pub const UPTIME_SECONDS: &str = "kestrel_uptime_seconds";
 pub const AGENT_MEMORY_BYTES: &str = "kestrel_agent_memory_bytes";
 pub const AGENT_CPU_USAGE_RATIO: &str = "kestrel_agent_cpu_usage_ratio";
+pub const BUFFER_DROPPED_TOTAL: &str = "kestrel_agent_buffer_dropped_total";
 pub const PROCESS_COUNT: &str = "kestrel_process_count";
 pub const PROCESS_CPU_RATIO: &str = "kestrel_process_cpu_ratio";
 pub const PROCESS_MEMORY_BYTES: &str = "kestrel_process_memory_bytes";
@@ -53,6 +54,7 @@ pub const DOCUMENTED: &[&str] = &[
     UPTIME_SECONDS,
     AGENT_MEMORY_BYTES,
     AGENT_CPU_USAGE_RATIO,
+    BUFFER_DROPPED_TOTAL,
     PROCESS_COUNT,
     PROCESS_CPU_RATIO,
     PROCESS_MEMORY_BYTES,
