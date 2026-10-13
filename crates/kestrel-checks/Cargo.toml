@@ -6,3 +6,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+kestrel-proto = { path = "../kestrel-proto" }
+sysinfo = "0.32"
