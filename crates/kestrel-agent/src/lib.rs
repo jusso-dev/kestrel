@@ -1,12 +1,24 @@
 //! Kestrel agent library. The binary in `main.rs` calls [`run`].
 
+pub mod buffer;
 pub mod config;
+pub mod scheduler;
+pub mod shipper;
 
-/// Load configuration, log the result, and return.
+use buffer::Buffer;
+use kestrel_checks::builtin_collectors;
+use scheduler::{run_batcher, spawn_collectors};
+use shipper::{sample_jitter, Shipper};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::{mpsc, watch};
+
+/// Load configuration and collect until the process is interrupted.
 ///
-/// The collector runtime is added with the scheduler. This entry point only
-/// owns configuration so `kestrel-agent --config` can be checked on its own.
-pub fn run() -> Result<(), config::ConfigError> {
+/// Samples are written to a size-capped segment log under the data directory
+/// and posted to the configured server in order.
+pub fn run() -> Result<(), AgentError> {
     config::init_tracing();
     let path = config::config_path_from_args(std::env::args().skip(1));
     let cfg = config::load_agent_config(&path)?;
@@ -19,5 +31,155 @@ pub fn run() -> Result<(), config::ConfigError> {
         "configuration loaded"
     );
     println!("kestrel-agent {}", env!("CARGO_PKG_VERSION"));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(serve(cfg))
+}
+
+async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let agent_id = load_or_create_agent_id(&cfg.data_dir)?;
+    let max_bytes = cfg.buffer_max_mb.saturating_mul(1024).saturating_mul(1024);
+    let buffer = Arc::new(Mutex::new(Buffer::open(
+        cfg.data_dir.join("buffer"),
+        max_bytes,
+    )?));
+    let (sample_tx, sample_rx) = mpsc::channel(256);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    spawn_collectors(builtin_collectors(), sample_tx, shutdown_rx.clone());
+
+    let batch_buffer = Arc::clone(&buffer);
+    let batch_id = agent_id.clone();
+    let batch_shutdown = shutdown_rx.clone();
+    let batcher = tokio::spawn(async move {
+        run_batcher(sample_rx, batch_buffer, batch_id, batch_shutdown).await;
+    });
+
+    let ship_buffer = Arc::clone(&buffer);
+    let ship_shutdown = shutdown_rx.clone();
+    let shipper_client = Shipper::new(&cfg.server_url)?;
+    let shipper = tokio::spawn(async move {
+        shipper_client
+            .run(
+                ship_buffer,
+                ship_shutdown,
+                tokio::time::sleep,
+                sample_jitter,
+            )
+            .await;
+    });
+
+    let sync_buffer = Arc::clone(&buffer);
+    let mut sync_shutdown = shutdown_rx;
+    let syncer = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = sync_shutdown.changed() => break,
+                _ = ticker.tick() => {
+                    let mut guard = sync_buffer.lock().unwrap_or_else(|err| err.into_inner());
+                    if let Err(err) = guard.poll_sync() {
+                        tracing::warn!(error = %err, "buffer sync failed");
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::signal::ctrl_c().await?;
+    let _ = shutdown_tx.send(true);
+    let _ = batcher.await;
+    let _ = shipper.await;
+    let _ = syncer.await;
+    let mut guard = buffer.lock().unwrap_or_else(|err| err.into_inner());
+    guard.sync()?;
     Ok(())
+}
+
+fn load_or_create_agent_id(data_dir: &Path) -> Result<String, AgentError> {
+    let path = data_dir.join("agent_id");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let id = text.trim();
+        if !id.is_empty() {
+            return Ok(id.to_string());
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let tmp = data_dir.join("agent_id.tmp");
+    std::fs::write(&tmp, &id)?;
+    replace_file(&tmp, &path)?;
+    Ok(id)
+}
+
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            if to.exists() {
+                std::fs::remove_file(to)?;
+                std::fs::rename(from, to)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
+/// A failure while loading configuration or running the agent.
+#[derive(Debug)]
+pub struct AgentError {
+    message: String,
+}
+
+impl std::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentError {}
+
+impl From<config::ConfigError> for AgentError {
+    fn from(err: config::ConfigError) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<std::io::Error> for AgentError {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
+impl From<shipper::ShipError> for AgentError {
+    fn from(err: shipper::ShipError) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_id_is_stable_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("kestrel-agent-id-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = load_or_create_agent_id(&dir).unwrap();
+        let second = load_or_create_agent_id(&dir).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -40,6 +40,7 @@ included. Zero-sized mounts are skipped.
 | `kestrel_uptime_seconds` | gauge | yes | yes | yes |
 | `kestrel_agent_memory_bytes` | gauge | yes | yes | yes |
 | `kestrel_agent_cpu_usage_ratio` | gauge | yes | yes | yes |
+| `kestrel_agent_buffer_dropped_total` | counter | yes | yes | yes |
 | `kestrel_process_count` | gauge | yes | yes | yes |
 | `kestrel_process_cpu_ratio` | gauge | yes | yes | yes |
 | `kestrel_process_memory_bytes` | gauge | yes | yes | yes |
@@ -125,8 +126,14 @@ Example: `kestrel_network_receive_bytes_total{iface="eth0"}`.
 |---|---|---|
 | `kestrel_agent_memory_bytes` | bytes | none |
 | `kestrel_agent_cpu_usage_ratio` | ratio | none |
+| `kestrel_agent_buffer_dropped_total` | batches | none |
 
-These describe the process that is running the collectors.
+`kestrel_agent_memory_bytes` and `kestrel_agent_cpu_usage_ratio` describe the
+process that is running the collectors. `kestrel_agent_buffer_dropped_total`
+is an absolute counter of batches discarded because the on-disk buffer was
+over `buffer_max_mb`. The shipper stamps the current total onto each flushed
+batch. The value is kept in the buffer state file, so a restart does not
+zero the counter.
 
 ## Processes
 

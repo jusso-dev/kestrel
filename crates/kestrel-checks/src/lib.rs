@@ -23,7 +23,7 @@ pub use logs::{
     MAX_LOG_LINE_BYTES,
 };
 pub use memory::MemoryCollector;
-pub use metrics::DOCUMENTED;
+pub use metrics::{BUFFER_DROPPED_TOTAL, DOCUMENTED};
 pub use network::NetworkCollector;
 pub use process::{ProcessCollector, TOP_PROCESSES};
 pub use selfstats::SelfStatsCollector;
