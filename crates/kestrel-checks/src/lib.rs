@@ -6,19 +6,28 @@
 mod cpu;
 mod diskio;
 mod filesystem;
+mod logs;
 mod memory;
 mod metrics;
 mod network;
+mod process;
 mod selfstats;
+mod service;
 mod uptime;
 
 pub use cpu::CpuCollector;
 pub use diskio::DiskIoCollector;
 pub use filesystem::FilesystemCollector;
+pub use logs::{
+    load_log_offsets, save_log_offsets, LogError, LogOffset, LogTailer, MAX_LOG_LINES_PER_TICK,
+    MAX_LOG_LINE_BYTES,
+};
 pub use memory::MemoryCollector;
 pub use metrics::DOCUMENTED;
 pub use network::NetworkCollector;
+pub use process::{ProcessCollector, TOP_PROCESSES};
 pub use selfstats::SelfStatsCollector;
+pub use service::ServiceCollector;
 pub use uptime::UptimeCollector;
 
 use kestrel_proto::Sample;
