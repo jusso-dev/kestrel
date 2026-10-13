@@ -5,4 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "kestrel"
+path = "src/main.rs"
+
 [dependencies]
+kestrel-server = { path = "../kestrel-server" }
+uuid = { version = "1", features = ["v4"] }
