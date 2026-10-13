@@ -1,0 +1,19 @@
+listen = "127.0.0.1:8080"
+database_url = "postgres://kestrel:kestrel@127.0.0.1:5432/kestrel"
+victoria_url = "http://127.0.0.1:8428"
+public_url = "http://127.0.0.1:8080"
+data_dir = "deploy/dev/data/server"
+
+[tls]
+cert_path = "deploy/dev/certs/server.crt"
+key_path = "deploy/dev/certs/server.key"
+
+[ca]
+cert_path = "deploy/dev/certs/ca.crt"
+key_path = "deploy/dev/certs/ca.key"
+
+[smtp]
+host = "127.0.0.1"
+port = 1025
+from = "kestrel@localhost"
+starttls = false

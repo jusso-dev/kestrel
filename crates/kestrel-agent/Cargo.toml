@@ -6,3 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+figment = { version = "0.10", features = ["test"] }
