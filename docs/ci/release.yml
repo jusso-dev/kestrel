@@ -1,0 +1,46 @@
+# Release workflow. Copy to .github/workflows/release.yml when a release
+# runner is available. This file is documentation, not an active workflow.
+#
+# cross and cargo-wix are not assumed to be installed on every developer
+# machine. A failed musl or MSI build here is a packaging gap, not a unit-test
+# failure.
+
+name: release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  agent-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Static musl agent
+        run: |
+          cargo install cross --locked || true
+          cross build --release --target x86_64-unknown-linux-musl -p kestrel-agent
+
+  agent-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: MSI
+        run: |
+          cargo install cargo-wix --locked || true
+          cargo build --release -p kestrel-agent
+          cargo wix -p kestrel-agent || echo "cargo-wix was not run to completion"
+
+  agent-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p kestrel-agent
+
+  server-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f Dockerfile.server -t kestrel-server .

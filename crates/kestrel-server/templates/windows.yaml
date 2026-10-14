@@ -1,0 +1,27 @@
+name: Windows
+description: Windows host metrics and agent reachability
+items:
+  - key: cpu
+    kind: builtin
+    interval_s: 30
+    params:
+      collector: cpu
+  - key: memory
+    kind: builtin
+    interval_s: 30
+    params:
+      collector: memory
+  - key: filesystem
+    kind: builtin
+    interval_s: 30
+    params:
+      collector: filesystem
+triggers:
+  - name: Disk space is low
+    expression: kestrel_filesystem_used_ratio > 0.9
+    severity: high
+    for_seconds: 300
+  - name: Agent is unreachable
+    expression: time() - kestrel_agent_last_seen_timestamp > 180
+    severity: high
+    for_seconds: 180

@@ -2,9 +2,11 @@
 
 pub mod buffer;
 pub mod config;
+pub mod desired;
 pub mod identity;
 mod perms;
 pub mod scheduler;
+pub mod service;
 pub mod shipper;
 
 use buffer::Buffer;

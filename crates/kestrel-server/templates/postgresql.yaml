@@ -1,0 +1,13 @@
+name: PostgreSQL
+description: PostgreSQL availability
+items:
+  - key: postgres.up
+    kind: http
+    interval_s: 30
+    params:
+      url: http://127.0.0.1:9187/metrics
+triggers:
+  - name: PostgreSQL exporter is down
+    expression: kestrel_http_up{job="postgres"} == 0
+    severity: high
+    for_seconds: 60

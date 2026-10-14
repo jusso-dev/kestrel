@@ -1,3 +1,5 @@
 /target
 /data/
 /deploy/dev/data/
+web/node_modules/
+web/.svelte-kit/

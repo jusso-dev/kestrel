@@ -10,6 +10,14 @@ pub mod v1 {
     include!(concat!(env!("OUT_DIR"), "/kestrel.v1.rs"));
 }
 
+pub mod remote {
+    include!(concat!(env!("OUT_DIR"), "/kestrel.remote.rs"));
+}
+
+pub mod otel {
+    include!(concat!(env!("OUT_DIR"), "/otel.metrics.v1.rs"));
+}
+
 /// Recommended cap on a decompressed batch. Callers may pass a tighter limit.
 pub const DEFAULT_MAX_DECOMPRESSED: usize = 32 * 1024 * 1024;
 

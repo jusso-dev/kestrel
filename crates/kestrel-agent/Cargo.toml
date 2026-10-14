@@ -22,6 +22,9 @@ url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.16"
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
 [dev-dependencies]
 figment = { version = "0.10", features = ["test"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }

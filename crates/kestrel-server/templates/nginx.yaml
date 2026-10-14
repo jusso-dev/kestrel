@@ -1,0 +1,13 @@
+name: Nginx
+description: Nginx HTTP check
+items:
+  - key: nginx.stub
+    kind: http
+    interval_s: 30
+    params:
+      url: http://127.0.0.1/nginx_status
+triggers:
+  - name: Nginx is down
+    expression: kestrel_http_up{job="nginx"} == 0
+    severity: high
+    for_seconds: 60

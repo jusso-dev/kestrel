@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg: #f6f4ef;
+  --fg: #1c1915;
+  --muted: #5c564c;
+  --line: #ddd6c8;
+  --accent: #9a3412;
+}
+
+:root.dark {
+  color-scheme: dark;
+  --bg: #161411;
+  --fg: #f3efe6;
+  --muted: #b7ad9e;
+  --line: #3a342c;
+  --accent: #fb923c;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.45 ui-sans-serif, system-ui, sans-serif;
+}
+
+a {
+  color: inherit;
+}

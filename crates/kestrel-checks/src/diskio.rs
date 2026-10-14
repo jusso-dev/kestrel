@@ -5,8 +5,11 @@
 //! volume for `IOCTL_DISK_PERFORMANCE`. macOS has no equivalent in sysinfo
 //! 0.32, so this collector returns no series there.
 
+#[cfg(any(target_os = "linux", windows))]
 use crate::metrics::{DISK_READ_BYTES_TOTAL, DISK_WRITTEN_BYTES_TOTAL};
-use crate::{sample, CollectError, Collector, Sample, DEFAULT_INTERVAL};
+#[cfg(any(target_os = "linux", windows))]
+use crate::sample;
+use crate::{CollectError, Collector, Sample, DEFAULT_INTERVAL};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
 use std::time::Duration;

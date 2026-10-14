@@ -53,6 +53,7 @@ impl TenantId {
 }
 
 /// Connection pool and the applied migrations.
+#[derive(Clone)]
 pub struct Db {
     pool: PgPool,
 }

@@ -1,0 +1,27 @@
+{
+  "name": "kestrel-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "gen:api": "openapi-typescript ../crates/kestrel-server/openapi.json -o src/lib/api/schema.d.ts"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/kit": "^2.8.1",
+    "@sveltejs/vite-plugin-svelte": "^4.0.1",
+    "autoprefixer": "^10.4.20",
+    "openapi-typescript": "^7.4.4",
+    "postcss": "^8.4.49",
+    "svelte": "^5.1.9",
+    "svelte-check": "^4.0.8",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.11"
+  },
+  "dependencies": {
+    "uplot": "^1.6.31"
+  }
+}

@@ -41,7 +41,8 @@ impl Collector for MemoryCollector {
 
     fn collect(&mut self, now_ms: i64) -> Result<Vec<Sample>, CollectError> {
         self.system.refresh_memory();
-        let samples = vec![
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut samples = vec![
             sample(
                 MEMORY_USED_BYTES,
                 &[],
@@ -71,14 +72,11 @@ impl Collector for MemoryCollector {
         // Load averages are a Unix concept. Windows has no equivalent in sysinfo.
         #[cfg(unix)]
         {
-            let mut samples = samples;
             let load = System::load_average();
             samples.push(sample(LOAD1, &[], load.one, now_ms));
             samples.push(sample(LOAD5, &[], load.five, now_ms));
             samples.push(sample(LOAD15, &[], load.fifteen, now_ms));
-            return Ok(samples);
         }
-        #[cfg(not(unix))]
         Ok(samples)
     }
 }

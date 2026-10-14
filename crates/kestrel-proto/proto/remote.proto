@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// Prometheus remote-write messages. Field numbers match the Prometheus
+// WriteRequest wire format; the package name is not on the wire.
+package kestrel.remote;
+
+message Label {
+  string name = 1;
+  string value = 2;
+}
+
+message Sample {
+  double value = 1;
+  int64 timestamp = 2;
+}
+
+message TimeSeries {
+  repeated Label labels = 1;
+  repeated Sample samples = 2;
+}
+
+message WriteRequest {
+  repeated TimeSeries timeseries = 1;
+}

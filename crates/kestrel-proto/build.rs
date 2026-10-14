@@ -6,6 +6,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("PROTOC", &protoc);
     }
     // prost's Message derive already implements Debug.
-    prost_build::Config::new().compile_protos(&["proto/kestrel.proto"], &["proto"])?;
+    prost_build::Config::new().compile_protos(
+        &[
+            "proto/kestrel.proto",
+            "proto/remote.proto",
+            "proto/otlp.proto",
+        ],
+        &["proto"],
+    )?;
     Ok(())
 }

@@ -1,15 +1,33 @@
 //! Kestrel server library. The binary in `main.rs` calls [`run`].
 
 pub mod admin;
+pub mod api;
+pub mod authz;
 pub mod ca;
 pub mod config;
+pub mod config_compile;
 pub mod db;
+pub mod discovery;
+pub mod escalation;
+pub mod forward;
 mod http;
+pub mod ingest;
+pub mod maintenance;
+pub mod notify;
+pub mod otlp;
+pub mod passwords;
 mod perms;
+pub mod poller;
+pub mod promql;
+pub mod quota;
+pub mod rules;
+pub mod secrets;
 mod store;
 mod tls;
+pub mod web;
 
-pub use http::{start, RunningServer};
+pub use http::{start, start_with, RunningServer};
+pub use store::{LabelledSample, MemoryStore, MetricStore};
 
 use std::error::Error;
 
@@ -34,7 +52,12 @@ pub fn run() -> Result<(), ServerError> {
     runtime.block_on(async {
         let db = db::Db::connect(&cfg.database_url).await?;
         tracing::info!("database migrations applied");
-        let server = start(cfg).await?;
+        let _ = poller::TimeoutPool::new(poller::DEFAULT_PERMITS);
+        let _ = poller::snmp_templates().len();
+        if let Err(err) = config_compile::ensure_builtin_templates(&db).await {
+            tracing::warn!(error = %err, "built-in templates were not loaded");
+        }
+        let server = start_with(cfg, Some(db.clone())).await?;
         tokio::signal::ctrl_c().await?;
         server.shutdown();
         drop(db);

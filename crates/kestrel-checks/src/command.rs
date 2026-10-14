@@ -1,0 +1,284 @@
+//! Nagios-compatible plugins and operator-configured scripts.
+//!
+//! The executable must resolve inside a plugin directory. The process is
+//! spawned directly, with no shell, and is killed when the timeout fires.
+
+use crate::perfdata::{parse_perfdata, PerfPoint};
+use crate::sample;
+use kestrel_proto::{CheckState, Sample};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::process::Command;
+
+pub const STDOUT_CAP: usize = 4 * 1024;
+
+pub struct CommandCheck {
+    pub id: String,
+    pub command: Vec<String>,
+    pub timeout: Duration,
+    pub interval: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandOutput {
+    pub state: CheckState,
+    pub output: String,
+    pub perfdata: String,
+    pub samples: Vec<Sample>,
+}
+
+#[derive(Debug)]
+pub struct CommandError {
+    message: String,
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CommandError {}
+
+impl CommandError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Resolve `command[0]` to a canonical file inside one of `plugin_dirs`.
+pub fn resolve_executable(
+    command: &[String],
+    plugin_dirs: &[PathBuf],
+) -> Result<PathBuf, CommandError> {
+    let exe = command
+        .first()
+        .map(String::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CommandError::new("command is empty"))?;
+    if exe.contains('\0') {
+        return Err(CommandError::new("command path is not allowed"));
+    }
+    let candidate = PathBuf::from(exe);
+    let escapes = candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir));
+    let resolved = if candidate.is_absolute() || escapes {
+        canonical_file(&candidate)?
+    } else if candidate.components().count() != 1 {
+        return Err(CommandError::new(
+            "relative commands must be a file name inside a plugin directory",
+        ));
+    } else {
+        let mut found = None;
+        for dir in plugin_dirs {
+            let path = dir.join(&candidate);
+            if let Ok(canonical) = canonical_file(&path) {
+                found = Some(canonical);
+                break;
+            }
+        }
+        found.ok_or_else(|| CommandError::new("command is not in a plugin directory"))?
+    };
+    if !inside_plugin_dir(&resolved, plugin_dirs) {
+        return Err(CommandError::new("command is not in a plugin directory"));
+    }
+    Ok(resolved)
+}
+
+fn canonical_file(path: &Path) -> Result<PathBuf, CommandError> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| CommandError::new("command is not in a plugin directory"))?;
+    if !canonical.is_file() {
+        return Err(CommandError::new("command is not in a plugin directory"));
+    }
+    Ok(canonical)
+}
+
+fn inside_plugin_dir(exe: &Path, plugin_dirs: &[PathBuf]) -> bool {
+    plugin_dirs.iter().any(|dir| {
+        let Ok(root) = dir.canonicalize() else {
+            return false;
+        };
+        exe.starts_with(&root) && exe != root
+    })
+}
+
+/// Run `check` if its executable is inside `plugin_dirs`.
+pub async fn run_command(
+    check: &CommandCheck,
+    plugin_dirs: &[PathBuf],
+    now_ms: i64,
+) -> Result<CommandOutput, CommandError> {
+    let exe = resolve_executable(&check.command, plugin_dirs)?;
+    let args = &check.command[1..];
+    let child = Command::new(&exe)
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| CommandError::new(format!("could not start command: {err}")))?;
+    let timeout = check.timeout.max(Duration::from_millis(1));
+    let collected = tokio::time::timeout(timeout, child.wait_with_output()).await;
+    let output = match collected {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => {
+            return Ok(unknown(
+                check,
+                &format!("could not read command output: {err}"),
+                now_ms,
+            ))
+        }
+        Err(_) => return Ok(unknown(check, "timed out", now_ms)),
+    };
+    let code = output.status.code().unwrap_or(3);
+    let state = CheckState::from_exit_code(code);
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&output.stderr).into_owned();
+    }
+    let text = cap_output(&text);
+    let (summary, perfdata) = split_output(&text);
+    let points = parse_perfdata(perfdata).unwrap_or_default();
+    let samples = samples_for(check, state, &points, now_ms);
+    Ok(CommandOutput {
+        state,
+        output: summary.to_string(),
+        perfdata: perfdata.to_string(),
+        samples,
+    })
+}
+
+fn unknown(check: &CommandCheck, output: &str, now_ms: i64) -> CommandOutput {
+    CommandOutput {
+        state: CheckState::Unknown,
+        output: output.to_string(),
+        perfdata: String::new(),
+        samples: samples_for(check, CheckState::Unknown, &[], now_ms),
+    }
+}
+
+fn cap_output(text: &str) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        if out.len() + ch.len_utf8() > STDOUT_CAP {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn split_output(text: &str) -> (&str, &str) {
+    match text.split_once('|') {
+        Some((summary, perf)) => (summary.trim(), perf.trim()),
+        None => (text.trim(), ""),
+    }
+}
+
+fn samples_for(
+    check: &CommandCheck,
+    state: CheckState,
+    points: &[PerfPoint],
+    now_ms: i64,
+) -> Vec<Sample> {
+    let labels = [("check", check.id.as_str())];
+    let mut samples = vec![sample(
+        "kestrel_check_state",
+        &labels,
+        state as i32 as f64,
+        now_ms,
+    )];
+    for point in points {
+        samples.push(sample(
+            "kestrel_check_perf",
+            &[
+                ("check", check.id.as_str()),
+                ("label", point.label.as_str()),
+                ("uom", point.uom.as_str()),
+            ],
+            point.value,
+            now_ms,
+        ));
+    }
+    samples
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plugin_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kestrel-plugins-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn command_outside_plugin_dirs_is_refused() {
+        let dir = plugin_dir("refuse");
+        let err =
+            resolve_executable(&["/bin/echo".to_string()], std::slice::from_ref(&dir)).unwrap_err();
+        assert!(err.to_string().contains("plugin directory"), "{err}");
+        let outside = dir.join("..").join("not-a-plugin");
+        let err = resolve_executable(&[outside.display().to_string()], &[dir]).unwrap_err();
+        assert!(err.to_string().contains("plugin directory"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_runs_a_fixture_inside_the_plugin_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = plugin_dir("fixture");
+        let script = dir.join("check_ok.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'OK | used=85%;90;95;0;100'\nexit 0\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let check = CommandCheck {
+            id: "disk".to_string(),
+            command: vec![script.display().to_string()],
+            timeout: Duration::from_secs(2),
+            interval: Duration::from_secs(60),
+        };
+        let output = run_command(&check, std::slice::from_ref(&dir), 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(output.state, CheckState::Ok);
+        assert!(output.output.contains("OK"));
+        assert!(output.perfdata.contains("used=85%"));
+        assert!(output
+            .samples
+            .iter()
+            .any(|sample| sample.name == "kestrel_check_perf"));
+        let sleeper = dir.join("check_sleep.sh");
+        std::fs::write(&sleeper, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut perms = std::fs::metadata(&sleeper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sleeper, perms).unwrap();
+        let slow = CommandCheck {
+            id: "slow".to_string(),
+            command: vec![sleeper.display().to_string()],
+            timeout: Duration::from_millis(200),
+            interval: Duration::from_secs(60),
+        };
+        let output = run_command(&slow, std::slice::from_ref(&dir), 1_700_000_000_000)
+            .await
+            .unwrap();
+        assert_eq!(output.state, CheckState::Unknown);
+        assert_eq!(output.output, "timed out");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

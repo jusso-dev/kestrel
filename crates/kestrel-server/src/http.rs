@@ -1,19 +1,26 @@
 //! Enrolment, renewal, and authenticated ingest.
 
+use crate::api::ApiState;
 use crate::ca::{self, Ca};
 use crate::config::ServerConfigFile;
+use crate::config_compile::{builtin_templates, compile_agent_config, HostView};
+use crate::ingest::{self, IngestDecision, IngestQueue};
 use crate::perms;
-use crate::store::{Directory, EnrolCommit};
+use crate::quota::Quotas;
+use crate::store::{Directory, EnrolCommit, MemoryStore, MetricStore, VictoriaStore};
 use crate::tls::{self, PeerAcceptor, PeerCert};
 use crate::ServerError;
-use axum::extract::{Request, State};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -21,6 +28,8 @@ struct AppState {
     store: Arc<Directory>,
     ca: Arc<Mutex<Ca>>,
     ca_pem: Arc<String>,
+    ingest: Arc<IngestQueue>,
+    quotas: Arc<Quotas>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +94,15 @@ impl Drop for RunningServer {
 
 /// Create the CA and server certificate when needed, then serve until dropped.
 pub async fn start(cfg: ServerConfigFile) -> Result<RunningServer, ServerError> {
+    start_with(cfg, None).await
+}
+
+/// Serve HTTPS. A database selects VictoriaMetrics; tests without one use the
+/// in-memory store so enrolment does not wait on a metrics process.
+pub async fn start_with(
+    cfg: ServerConfigFile,
+    db: Option<crate::db::Db>,
+) -> Result<RunningServer, ServerError> {
     let ca = Ca::load_or_create(&cfg.ca.cert_path, &cfg.ca.key_path)?;
     let ca_pem = ca.cert_pem().to_string();
     let (dns, ips) = ca::server_names(&cfg.public_url, cfg.listen.ip());
@@ -105,12 +123,27 @@ pub async fn start(cfg: ServerConfigFile) -> Result<RunningServer, ServerError> 
         (issued.cert_pem, issued.key_pem)
     };
     let store = Arc::new(Directory::open(&cfg.data_dir)?);
+    let metrics: Arc<dyn MetricStore> = if db.is_some() {
+        Arc::new(VictoriaStore::new(cfg.victoria_url.as_str())?)
+    } else {
+        Arc::new(MemoryStore::new())
+    };
+    let (queue, rx) = IngestQueue::new(ingest::INGEST_QUEUE_CAPACITY);
+    let ingest = Arc::new(queue);
+    let writer = tokio::spawn(ingest::run_writer(rx, Arc::clone(&metrics), 1_000));
+    let quotas = Arc::new(Quotas::per_second(50_000));
+    let api_state = ApiState::new(
+        Arc::new(crate::api::MemoryCatalog::new()),
+        Arc::clone(&metrics),
+    );
     let state = AppState {
         store,
         ca: Arc::new(Mutex::new(ca)),
         ca_pem: Arc::new(ca_pem.clone()),
+        ingest,
+        quotas,
     };
-    let app = router(state);
+    let app = router(state, api_state);
     let public_tls = tls::rustls_config(&server_cert, &server_key, &ca_pem, false)?;
     let (handle, task, addr) = spawn_listener(cfg.listen, public_tls, app.clone()).await?;
     let mut handles = vec![handle];
@@ -123,6 +156,7 @@ pub async fn start(cfg: ServerConfigFile) -> Result<RunningServer, ServerError> 
         handles.push(handle);
         tasks.push(task);
     }
+    tasks.push(writer);
     tracing::info!(%addr, ?ingest_addr, "https listeners started");
     Ok(RunningServer {
         addr,
@@ -132,15 +166,21 @@ pub async fn start(cfg: ServerConfigFile) -> Result<RunningServer, ServerError> 
     })
 }
 
-fn router(state: AppState) -> Router {
-    let guarded = Router::new()
+fn router(state: AppState, api_state: ApiState) -> Router {
+    let ingest_routes = Router::new()
         .route("/api/v1/ingest", post(ingest))
+        .layer(DefaultBodyLimit::max(ingest::INGEST_BODY_LIMIT));
+    let guarded = Router::new()
+        .merge(ingest_routes)
         .route("/api/v1/renew", post(renew))
+        .route("/api/v1/agent/config", get(agent_config))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_agent));
     Router::new()
         .route("/api/v1/enrol", post(enrol))
         .merge(guarded)
         .with_state(state)
+        .merge(crate::api::router(api_state))
+        .merge(crate::web::router())
 }
 
 async fn spawn_listener(
@@ -235,8 +275,90 @@ async fn renew(
     }))
 }
 
-async fn ingest() -> axum::http::StatusCode {
-    axum::http::StatusCode::OK
+async fn ingest(
+    State(state): State<AppState>,
+    axum::Extension(agent): axum::Extension<AuthedAgent>,
+    body: Bytes,
+) -> axum::http::StatusCode {
+    if body.len() > ingest::INGEST_BODY_LIMIT {
+        return axum::http::StatusCode::PAYLOAD_TOO_LARGE;
+    }
+    let (tenant_id, host) = state
+        .store
+        .agent_meta(agent.0)
+        .unwrap_or((crate::store::DEFAULT_TENANT_ID, "unknown".to_string()));
+    let prepared =
+        match ingest::prepare_batch(&body, &tenant_id.to_string(), &host, &agent.0.to_string()) {
+            Ok(prepared) => prepared,
+            Err(IngestDecision::Rejected(_)) => return axum::http::StatusCode::BAD_REQUEST,
+            Err(_) => return axum::http::StatusCode::BAD_REQUEST,
+        };
+    let samples = u32::try_from(prepared.samples.len()).unwrap_or(u32::MAX);
+    if state.quotas.check(tenant_id, samples).is_err() {
+        return axum::http::StatusCode::TOO_MANY_REQUESTS;
+    }
+    match state
+        .ingest
+        .submit(&agent.0.to_string(), prepared.seq, prepared.samples)
+    {
+        IngestDecision::Accepted | IngestDecision::Duplicate => axum::http::StatusCode::OK,
+        IngestDecision::Overloaded => axum::http::StatusCode::TOO_MANY_REQUESTS,
+        IngestDecision::Rejected(_) => axum::http::StatusCode::BAD_REQUEST,
+    }
+}
+
+async fn agent_config(
+    State(state): State<AppState>,
+    axum::Extension(agent): axum::Extension<AuthedAgent>,
+    request: Request,
+) -> Response {
+    let host_name = state
+        .store
+        .agent_meta(agent.0)
+        .map(|(_, host)| host)
+        .unwrap_or_else(|| "unknown".to_string());
+    let templates = builtin_templates();
+    let linux = templates.into_iter().find(|doc| doc.name == "Linux");
+    let templates = linux.into_iter().collect::<Vec<_>>();
+    let (config, etag) = compile_agent_config(
+        &HostView {
+            name: host_name,
+            overrides: BTreeMap::new(),
+        },
+        &templates,
+    );
+    let presented = request
+        .headers()
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if presented == etag {
+        return axum::http::StatusCode::NOT_MODIFIED.into_response();
+    }
+    let checks = config
+        .checks
+        .iter()
+        .map(|check| {
+            serde_json::json!({
+                "id": check.id,
+                "command": check.command,
+                "interval_s": check.interval_s,
+                "timeout_s": check.timeout_s,
+            })
+        })
+        .collect::<Vec<_>>();
+    let logs = config
+        .logs
+        .iter()
+        .map(|log| serde_json::json!({ "path": log.path, "pattern": log.pattern }))
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "interval_s": config.interval_s,
+        "checks": checks,
+        "logs": logs,
+        "etag": etag,
+    });
+    ([(axum::http::header::ETAG, etag)], Json(body)).into_response()
 }
 
 async fn require_agent(

@@ -32,5 +32,23 @@ services:
       - "1025:1025"
       - "8025:8025"
 
+  # Optional lab SNMP simulator. Not started by default.
+  snmpsim:
+    image: tandrup/snmpsim:latest
+    profiles: ["snmp"]
+    ports:
+      - "1161:1161/udp"
+
+  # Optional local OTLP receiver. Kestrel's own /v1/metrics endpoint does not
+  # need this process; it is here for manual comparison.
+  otel-collector:
+    image: otel/opentelemetry-collector:0.111.0
+    profiles: ["otel"]
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4318:4318"
+
 volumes:
   kestrel-pg:

@@ -43,6 +43,18 @@ web/              the web UI (added in M1)
 
 Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/adr](docs/adr).
 
+## Docs
+
+- [Quick start](docs/quickstart.md)
+- [Agent](docs/agent.md)
+- [Triggers](docs/triggers.md)
+- [Operations](docs/operations.md)
+- [Roles](docs/rbac.md)
+- [Wedgetail](docs/integrations/wedgetail.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+
 ## Roadmap
 
 - **M0 Skeleton:** workspace, config, protocol, dev stack

@@ -1,0 +1,14 @@
+# Multi-stage server image. The runtime stage is distroless and non-root.
+# SNMP v3 links OpenSSL via the snmp2 crate. This image was not executed as a
+# release; see docs/VALIDATION.md.
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p kestrel-server
+
+FROM gcr.io/distroless/cc-debian12
+COPY --from=build /src/target/release/kestrel-server /kestrel-server
+USER nonroot:nonroot
+EXPOSE 8443
+ENTRYPOINT ["/kestrel-server"]

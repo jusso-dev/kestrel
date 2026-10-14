@@ -1,0 +1,17 @@
+[Unit]
+Description=Kestrel monitoring agent
+After=network-online.target
+
+[Service]
+User=kestrel
+Group=kestrel
+ExecStart=/usr/local/bin/kestrel-agent --config /etc/kestrel/agent.toml
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/kestrel
+
+[Install]
+WantedBy=multi-user.target

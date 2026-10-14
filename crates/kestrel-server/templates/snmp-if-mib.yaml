@@ -1,0 +1,20 @@
+name: SNMP IF-MIB
+description: Interface counters from IF-MIB and ifXTable
+items:
+  - key: snmp.ifTable
+    kind: snmp
+    interval_s: 60
+    params:
+      oid: 1.3.6.1.2.1.2.2.1
+      walk: true
+  - key: snmp.ifXTable
+    kind: snmp
+    interval_s: 60
+    params:
+      oid: 1.3.6.1.2.1.31.1.1.1
+      walk: true
+triggers:
+  - name: Interface is down
+    expression: snmp_if_oper_status == 2
+    severity: warning
+    for_seconds: 180

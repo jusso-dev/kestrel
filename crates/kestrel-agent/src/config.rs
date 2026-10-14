@@ -57,6 +57,18 @@ pub struct AgentConfigFile {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub allow_remote_commands: bool,
+    /// Directories the agent may execute. Empty unless the operator sets them.
+    #[serde(default)]
+    pub plugin_dirs: Vec<PathBuf>,
+    /// Local Prometheus exposition address. Only loopback values are accepted.
+    #[serde(default)]
+    pub prometheus_listen: Option<String>,
+    #[serde(default = "default_config_poll_s")]
+    pub config_poll_s: u64,
+}
+
+fn default_config_poll_s() -> u64 {
+    60
 }
 
 /// Configuration could not be loaded. The message names the missing field.

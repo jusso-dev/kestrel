@@ -1,0 +1,7 @@
+<h1 class="text-2xl">Configuration</h1>
+<p class="mt-2 text-[var(--muted)]">Templates, host groups, items and discovery rules.</p>
+<label class="mt-4 block text-sm">Tenant
+  <select class="mt-1 block border border-[var(--line)] bg-transparent px-2 py-1">
+    <option>This tenant</option>
+  </select>
+</label>

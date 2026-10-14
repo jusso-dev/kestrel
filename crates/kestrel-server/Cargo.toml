@@ -5,32 +5,68 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["embed-ui"]
+embed-ui = ["dep:rust-embed"]
+
 [dependencies]
+age = "0.11"
+argon2 = { version = "0.5", features = ["std"] }
+async-trait = "0.1"
 axum = "0.7"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+chrono-tz = "0.10"
 data-encoding = "2"
 figment = { version = "0.10", features = ["toml", "env"] }
+futures = "0.3"
 getrandom = "0.2"
+governor = "0.6"
+hmac = "0.12"
 http = "1"
+kestrel-checks = { path = "../kestrel-checks" }
+kestrel-proto = { path = "../kestrel-proto" }
+lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
+mime_guess = "2"
+minijinja = "2"
+promql-parser = "0.4"
+prost = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rrule = "0.13"
+rust-embed = { version = "8", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 sha2 = "0.10"
+snap = "1"
+snmp2 = { version = "0.4", features = ["v3"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "limit", "set-header", "trace"] }
 tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
+utoipa = { version = "5", features = ["chrono", "uuid"] }
+utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.16"
 
 [dev-dependencies]
+axum-test = "16"
+criterion = "0.5"
 figment = { version = "0.10", features = ["test"] }
 kestrel-agent = { path = "../kestrel-agent" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+wiremock = "0.6"
+
+[[bench]]
+name = "ingest"
+harness = false

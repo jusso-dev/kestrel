@@ -162,6 +162,20 @@ impl Directory {
         .unwrap_or(false)
     }
 
+    pub fn agent_meta(&self, agent_id: Uuid) -> Option<(Uuid, String)> {
+        self.with_ref(|state| {
+            Ok(state.agents.iter().find_map(|agent| {
+                if agent.id == agent_id && agent.revoked_at.is_none() {
+                    Some((agent.tenant_id, agent.hostname.clone()))
+                } else {
+                    None
+                }
+            }))
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn revoke(&self, agent_id: Uuid) -> Result<(), ServerError> {
         self.with_mut(|state| {
             let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) else {

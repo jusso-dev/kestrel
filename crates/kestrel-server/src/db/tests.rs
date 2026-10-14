@@ -56,7 +56,7 @@ async fn db_migrations_are_idempotent() {
             .fetch_one(&db.pool)
             .await
             .map_err(super::db_err)?;
-        assert_eq!(applied, 1);
+        assert_eq!(applied, 2);
         let names: Vec<String> = sqlx::query_scalar("SELECT name FROM tenants ORDER BY name")
             .fetch_all(&db.pool)
             .await

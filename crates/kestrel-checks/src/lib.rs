@@ -3,21 +3,30 @@
 //! Each collector implements [`Collector`] and stamps samples with the
 //! `now_ms` it is given, so callers and tests supply the clock.
 
+mod command;
 mod cpu;
 mod diskio;
 mod filesystem;
+mod http;
 mod logs;
 mod memory;
 mod metrics;
 mod network;
+mod perfdata;
 mod process;
+mod prom_scrape;
 mod selfstats;
 mod service;
 mod uptime;
 
+pub use command::{resolve_executable, run_command, CommandCheck, CommandError, CommandOutput};
 pub use cpu::CpuCollector;
 pub use diskio::DiskIoCollector;
 pub use filesystem::FilesystemCollector;
+pub use http::{
+    expiry_from_der, probe_tls_expiry, run_http_check, with_expiry, HttpCheck, HttpOutcome,
+    RecordingVerifier,
+};
 pub use logs::{
     load_log_offsets, save_log_offsets, LogError, LogOffset, LogTailer, MAX_LOG_LINES_PER_TICK,
     MAX_LOG_LINE_BYTES,
@@ -25,7 +34,12 @@ pub use logs::{
 pub use memory::MemoryCollector;
 pub use metrics::{BUFFER_DROPPED_TOTAL, DOCUMENTED};
 pub use network::NetworkCollector;
+pub use perfdata::{parse_perfdata, PerfPoint};
 pub use process::{ProcessCollector, TOP_PROCESSES};
+pub use prom_scrape::{
+    encode_exposition, parse_exposition, relabel, to_agent_samples, validate_exposition,
+    ExpositionSample,
+};
 pub use selfstats::SelfStatsCollector;
 pub use service::ServiceCollector;
 pub use uptime::UptimeCollector;
