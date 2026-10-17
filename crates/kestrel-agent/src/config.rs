@@ -49,6 +49,9 @@ pub struct AgentConfigFile {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub enrol_token: Option<String>,
+    /// Out-of-band CA trust for enrollment against a private server PKI.
+    #[serde(default)]
+    pub bootstrap_ca_path: Option<PathBuf>,
     #[serde(default = "default_interval_s")]
     pub interval_s: u32,
     #[serde(default = "default_buffer_max_mb")]
@@ -109,10 +112,38 @@ pub fn load_agent_config(path: &Path) -> Result<AgentConfigFile, ConfigError> {
     if path.is_file() {
         figment = figment.merge(Toml::file(path));
     }
-    figment
+    let config: AgentConfigFile = figment
         .merge(Env::prefixed("KESTREL_").split("__"))
         .extract()
-        .map_err(|err| ConfigError(format!("{} ({})", err, path.display())))
+        .map_err(|err| ConfigError(format!("{} ({})", err, path.display())))?;
+    validate_server_url(&config.server_url)?;
+    Ok(config)
+}
+
+pub(crate) fn validate_server_url(url: &Url) -> Result<(), ConfigError> {
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError(
+            "server URL must not include credentials, a query, or a fragment".into(),
+        ));
+    }
+    if url.scheme() != "https"
+        && !(url.scheme() == "http"
+            && url.host_str().is_some_and(|host| {
+                host == "localhost"
+                    || host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            }))
+    {
+        return Err(ConfigError(
+            "server URL must use HTTPS (HTTP is allowed for loopback development)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Install a process-wide tracing subscriber.
@@ -159,6 +190,22 @@ mod tests {
             default_config_path(Platform::Windows),
             PathBuf::from(r"C:\ProgramData\Kestrel\agent.toml")
         );
+    }
+
+    #[test]
+    fn server_urls_reject_embedded_credentials_and_nonlocal_plain_http() {
+        for raw in [
+            "https://user:fixture@monitor.example",
+            "https://monitor.example?token=fixture",
+            "https://monitor.example/#fixture",
+            "http://monitor.example",
+        ] {
+            let error = validate_server_url(&Url::parse(raw).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("fixture"));
+        }
+        assert!(validate_server_url(&Url::parse("http://127.0.0.1:8080").unwrap()).is_ok());
     }
 
     #[test]

@@ -16,6 +16,7 @@ sysinfo = "0.32"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "time"] }
 tokio-rustls = "0.26"
 x509-parser = "0.16"
+webpki-roots = "1"
 
 [dev-dependencies]
 rcgen = { version = "0.13", features = ["pem"] }

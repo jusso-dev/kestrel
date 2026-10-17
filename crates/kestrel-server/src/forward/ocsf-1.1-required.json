@@ -1,0 +1,51 @@
+{
+  "description": "Kestrel emission contract derived from required OCSF v1.1.0 attributes and emitted object constraints; this is not the complete OCSF schema.",
+  "sources": [
+    "https://github.com/ocsf/ocsf-schema/blob/v1.1.0/events/base_event.json",
+    "https://github.com/ocsf/ocsf-schema/blob/v1.1.0/includes/classification.json",
+    "https://github.com/ocsf/ocsf-schema/blob/v1.1.0/includes/occurrence.json",
+    "https://github.com/ocsf/ocsf-schema/blob/v1.1.0/events/findings/finding.json",
+    "https://github.com/ocsf/ocsf-schema/blob/v1.1.0/events/application/api.json",
+    "https://github.com/ocsf/ocsf-schema/tree/v1.1.0/objects"
+  ],
+  "base": {
+    "type": "object",
+    "required": ["activity_id", "category_uid", "class_uid", "type_uid", "time", "metadata", "severity_id"],
+    "properties": {
+      "activity_id": {"type": "integer"},
+      "category_uid": {"type": "integer"},
+      "class_uid": {"type": "integer"},
+      "type_uid": {"type": "integer"},
+      "time": {"type": "integer"},
+      "severity_id": {"type": "integer", "enum": [0,1,2,3,4,5,6,99]},
+      "metadata": {
+        "type": "object", "required": ["version", "product"],
+        "properties": {
+          "version": {"type": "string", "enum": ["1.1.0"]},
+          "product": {"type": "object", "required": ["vendor_name", "name"], "properties": {"vendor_name": {"type": "string"}, "name": {"type": "string"}}}
+        }
+      }
+    }
+  },
+  "classes": {
+    "2004": {
+      "type": "object", "required": ["finding_info"],
+      "properties": {
+        "category_uid": {"enum": [2]},
+        "activity_id": {"enum": [1,2,3]},
+        "status_id": {"enum": [0,1,2,3,4,99]},
+        "finding_info": {"type": "object", "required": ["uid", "title"], "properties": {"uid": {"type": "string"}, "title": {"type": "string"}}}
+      }
+    },
+    "6003": {
+      "type": "object", "required": ["api", "actor", "src_endpoint"],
+      "properties": {
+        "category_uid": {"enum": [6]},
+        "activity_id": {"enum": [1,2,3,4]},
+        "api": {"type": "object", "required": ["operation"], "properties": {"operation": {"type": "string"}}},
+        "actor": {"type": "object", "required": ["user"], "properties": {"user": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}}},
+        "src_endpoint": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}}
+      }
+    }
+  }
+}

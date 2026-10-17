@@ -1,29 +1,32 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { list, request } from '$lib/api/client';
 
   let tenants: { id: string; name?: string }[] = [];
   let overview = '';
   let message = '';
 
-  onMount(async () => {
-    const listed = await fetch('/api/v1/tenants');
-    if (listed.ok) {
-      const body = await listed.json();
-      tenants = Array.isArray(body.items) ? body.items : [];
-    }
-    const msp = await fetch('/api/v1/msp/overview');
-    overview = msp.ok ? JSON.stringify(await msp.json()) : 'MSP overview is limited to owners and admins.';
-  });
+  async function refresh() {
+    try {
+      tenants = await list<{ id: string; name?: string }>('/tenants');
+      try { overview = JSON.stringify(await request('/msp/overview')); }
+      catch { overview = 'MSP overview is limited to owners and admins.'; }
+    } catch (cause) { message = cause instanceof Error ? cause.message : 'Unable to load administration.'; }
+  }
+  onMount(() => { void refresh(); });
 
   async function switchTenant(event: Event) {
     const tenantId = (event.currentTarget as HTMLSelectElement).value;
     if (!tenantId) return;
-    const response = await fetch('/api/v1/session/tenant', {
+    try {
+      const response = await fetch('/api/v1/session/tenant', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ tenant_id: tenantId })
     });
-    message = response.ok ? 'Tenant switched' : 'Switch refused. An MSP grant is required.';
+      message = response.ok ? 'Tenant switched' : 'Switch refused. An MSP grant is required.';
+      if (response.ok) await refresh();
+    } catch { message = 'Unable to reach the server.'; }
   }
 </script>
 

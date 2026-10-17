@@ -53,6 +53,13 @@ impl ShipError {
 }
 
 impl Shipper {
+    /// Current authenticated client, including certificate renewals.
+    pub fn client(&self) -> reqwest::Client {
+        self.client
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
     /// POST batches to `{server_url}/api/v1/ingest`.
     pub fn new(server_url: &Url) -> Result<Self, ShipError> {
         Ok(Self {
@@ -225,6 +232,7 @@ enum Action {
 
 /// `{server}/api/v1/ingest`, keeping any existing path prefix.
 pub fn ingest_url(server: &Url) -> Result<Url, ShipError> {
+    crate::config::validate_server_url(server).map_err(|err| ShipError::new(err.to_string()))?;
     let mut base = server.clone();
     if !base.path().ends_with('/') {
         let path = format!("{}/", base.path());

@@ -26,6 +26,19 @@ pub struct HttpOutcome {
     pub samples: Vec<Sample>,
 }
 
+pub(crate) fn metric_target(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut url) => {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            url.to_string()
+        }
+        Err(_) => "invalid URL".into(),
+    }
+}
+
 /// `not_after` of a leaf certificate, as unix seconds.
 pub fn expiry_from_der(der: &[u8]) -> Option<i64> {
     let (_, cert) = X509Certificate::from_der(der).ok()?;
@@ -132,7 +145,36 @@ pub async fn probe_tls_expiry(
 }
 
 pub async fn run_http_check(check: &HttpCheck, now_ms: i64) -> HttpOutcome {
+    let valid = reqwest::Url::parse(&check.url).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+    });
+    if !valid {
+        return failed(
+            check,
+            now_ms,
+            None,
+            0.0,
+            "HTTP URL must use HTTP(S) without embedded credentials",
+        );
+    }
+    ensure_crypto_provider();
+    let expiry = RecordingVerifier::expiry_handle();
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let verifier = match rustls::client::WebPkiServerVerifier::builder(Arc::new(roots)).build() {
+        Ok(verifier) => verifier,
+        Err(err) => return failed(check, now_ms, None, 0.0, &err.to_string()),
+    };
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(RecordingVerifier::new(
+            verifier,
+            expiry.clone(),
+        )))
+        .with_no_client_auth();
     let client = match reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
         .timeout(check.timeout.max(Duration::from_millis(1)))
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -142,11 +184,39 @@ pub async fn run_http_check(check: &HttpCheck, now_ms: i64) -> HttpOutcome {
     };
     let started = Instant::now();
     let response = client.get(&check.url).send().await;
-    let duration = started.elapsed().as_secs_f64();
-    match response {
-        Ok(response) => {
+    let mut result = match response {
+        Ok(mut response) => {
             let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
+            let mut body = Vec::new();
+            // Bounds apply while reading, including chunked bodies with no
+            // Content-Length. Read errors and body timeouts fail the check.
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len() + chunk.len() <= 1024 * 1024 => {
+                        body.extend_from_slice(&chunk)
+                    }
+                    Ok(Some(_)) => {
+                        return failed(
+                            check,
+                            now_ms,
+                            Some(status),
+                            started.elapsed().as_secs_f64(),
+                            "response body exceeds 1 MiB",
+                        )
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        return failed(
+                            check,
+                            now_ms,
+                            Some(status),
+                            started.elapsed().as_secs_f64(),
+                            &err.without_url().to_string(),
+                        )
+                    }
+                }
+            }
+            let body = String::from_utf8_lossy(&body);
             let regex_ok = match &check.body_regex {
                 Some(pattern) => regex_matches(pattern, &body),
                 None => true,
@@ -159,10 +229,29 @@ pub async fn run_http_check(check: &HttpCheck, now_ms: i64) -> HttpOutcome {
             } else {
                 format!("HTTP {status}")
             };
-            outcome(check, now_ms, up, Some(status), duration, None, &detail)
+            outcome(
+                check,
+                now_ms,
+                up,
+                Some(status),
+                started.elapsed().as_secs_f64(),
+                None,
+                &detail,
+            )
         }
-        Err(err) => failed(check, now_ms, None, duration, &err.to_string()),
+        Err(err) => failed(
+            check,
+            now_ms,
+            None,
+            started.elapsed().as_secs_f64(),
+            &err.without_url().to_string(),
+        ),
+    };
+    let recorded = *expiry.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(expiry) = recorded {
+        result = with_expiry(result, check, expiry, now_ms);
     }
+    result
 }
 
 fn regex_matches(pattern: &str, body: &str) -> bool {
@@ -194,7 +283,8 @@ fn outcome(
     expiry: Option<i64>,
     detail: &str,
 ) -> HttpOutcome {
-    let labels = [("target", check.url.as_str()), ("check", check.id.as_str())];
+    let target = metric_target(&check.url);
+    let labels = [("target", target.as_str()), ("check", check.id.as_str())];
     let mut samples = vec![
         sample(
             "kestrel_http_up",
@@ -238,7 +328,8 @@ pub fn with_expiry(
     expiry: i64,
     now_ms: i64,
 ) -> HttpOutcome {
-    let labels = [("target", check.url.as_str()), ("check", check.id.as_str())];
+    let target = metric_target(&check.url);
+    let labels = [("target", target.as_str()), ("check", check.id.as_str())];
     outcome.expiry_unix = Some(expiry);
     outcome.samples.push(sample(
         "kestrel_tls_cert_expiry_timestamp_seconds",
@@ -260,9 +351,8 @@ pub fn with_expiry(
 mod tests {
     use super::*;
     use rcgen::{CertificateParams, KeyPair};
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::{DigitallySignedStruct, Error, SignatureScheme};
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::CertificateDer;
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -277,6 +367,24 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         assert!(expiry > now, "not_after {expiry} should be in the future");
+    }
+
+    #[tokio::test]
+    async fn http_target_labels_do_not_expose_url_credentials_or_query_strings() {
+        let check = HttpCheck {
+            id: "private".into(),
+            url: "https://user:fixture-secret@monitor.example/path?token=fixture-secret".into(),
+            timeout: Duration::from_secs(1),
+            body_regex: None,
+        };
+        let result = run_http_check(&check, 1).await;
+        assert!(!result.up);
+        assert!(!result.detail.contains("fixture-secret"));
+        assert!(result
+            .samples
+            .iter()
+            .flat_map(|sample| &sample.labels)
+            .all(|(_, value)| !value.contains("fixture-secret")));
     }
 
     #[tokio::test]
@@ -330,7 +438,12 @@ mod tests {
         let expected = expiry_from_der(cert.der()).unwrap();
         let addr = tls_serve(cert.der().to_vec(), key.serialize_der()).await;
         let expiry = RecordingVerifier::expiry_handle();
-        let verifier = Arc::new(AcceptAll) as Arc<dyn ServerCertVerifier>;
+        ensure_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap() as Arc<dyn ServerCertVerifier>;
         let found = probe_tls_expiry("localhost", addr.port(), verifier, Arc::clone(&expiry))
             .await
             .unwrap();
@@ -410,47 +523,5 @@ mod tests {
             }
         });
         addr
-    }
-
-    #[derive(Debug)]
-    struct AcceptAll;
-
-    impl ServerCertVerifier for AcceptAll {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::ED25519,
-            ]
-        }
     }
 }

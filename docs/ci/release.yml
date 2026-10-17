@@ -1,46 +1,138 @@
-# Release workflow. Copy to .github/workflows/release.yml when a release
-# runner is available. This file is documentation, not an active workflow.
-#
-# cross and cargo-wix are not assumed to be installed on every developer
-# machine. A failed musl or MSI build here is a packaging gap, not a unit-test
-# failure.
-
+# Copy into .github/workflows when release credentials have been configured.
+# Every packaging failure is fatal; an artifact upload is not a release.
 name: release
-
 on:
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
   agent-linux:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Static musl agent
+      - run: sudo apt-get update && sudo apt-get install -y minisign
+      - run: cargo install cross --locked
+      - name: Static agent under 15 MB
+        shell: bash
         run: |
-          cargo install cross --locked || true
-          cross build --release --target x86_64-unknown-linux-musl -p kestrel-agent
-
+          cross build --locked --release --target ${{ matrix.target }} -p kestrel-agent
+          binary=target/${{ matrix.target }}/release/kestrel-agent
+          file "$binary" | tee binary-type.txt
+          grep -Eq 'statically linked|static-pie linked' binary-type.txt
+          test "$(stat -c %s "$binary")" -lt 15000000
+          mkdir artifacts
+          cp "$binary" artifacts/kestrel-agent-${{ matrix.target }}
+          cd artifacts
+          sha256sum kestrel-agent-* > SHA256SUMS
+      - name: Sign and verify Linux release artifacts
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.RELEASE_MINISIGN_SECRET_KEY }}
+        run: |
+          set +x
+          : "${MINISIGN_SECRET_KEY:?Set RELEASE_MINISIGN_SECRET_KEY before building a release}"
+          umask 077
+          signing_key=$(mktemp "$RUNNER_TEMP/kestrel-minisign.XXXXXX")
+          trap 'rm -f "$signing_key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$signing_key"
+          unset MINISIGN_SECRET_KEY
+          # CI uses a dedicated unencrypted key protected by GitHub Secrets.
+          minisign -R -s "$signing_key" -p artifacts/minisign.pub </dev/null
+          for artifact in artifacts/kestrel-agent-* artifacts/SHA256SUMS; do
+            minisign -S -s "$signing_key" -m "$artifact" </dev/null
+            minisign -V -p artifacts/minisign.pub -m "$artifact"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
   agent-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: MSI
-        run: |
-          cargo install cargo-wix --locked || true
-          cargo build --release -p kestrel-agent
-          cargo wix -p kestrel-agent || echo "cargo-wix was not run to completion"
-
+      - run: cargo install cargo-wix --locked
+      - run: cargo build --locked --release -p kestrel-agent
+      - run: cargo wix -p kestrel-agent --no-build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-windows
+          path: target/wix/*.msi
+          if-no-files-found: error
   agent-macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p kestrel-agent
-
-  server-image:
-    runs-on: ubuntu-latest
+      - run: cargo build --locked --release -p kestrel-agent
+      - name: Sign agent
+        env:
+          APPLICATION_IDENTITY: ${{ secrets.MACOS_APPLICATION_IDENTITY }}
+        run: |
+          test -n "$APPLICATION_IDENTITY"
+          codesign --force --options runtime --timestamp --sign "$APPLICATION_IDENTITY" target/release/kestrel-agent
+          codesign --verify --strict target/release/kestrel-agent
+      - name: Build launchd package
+        shell: bash
+        run: |
+          mkdir -p pkgroot/usr/local/bin pkgroot/Library/LaunchDaemons
+          cp target/release/kestrel-agent pkgroot/usr/local/bin/
+          cp deploy/launchd/au.jusso-dev.kestrel-agent.plist pkgroot/Library/LaunchDaemons/
+          pkgbuild --root pkgroot --identifier au.jusso-dev.kestrel-agent --version 0.0.1 kestrel-agent-unsigned.pkg
+      # The runner keychain must contain a Developer ID Installer identity.
+      - name: Sign installer
+        env:
+          INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+        run: |
+          test -n "$INSTALLER_IDENTITY"
+          productsign --sign "$INSTALLER_IDENTITY" kestrel-agent-unsigned.pkg kestrel-agent.pkg
+          pkgutil --check-signature kestrel-agent.pkg
+      - name: Notarise and staple
+        env:
+          NOTARY_PROFILE: ${{ secrets.MACOS_NOTARY_PROFILE }}
+        run: |
+          test -n "$NOTARY_PROFILE"
+          xcrun notarytool submit kestrel-agent.pkg --keychain-profile "$NOTARY_PROFILE" --wait
+          xcrun stapler staple kestrel-agent.pkg
+          xcrun stapler validate kestrel-agent.pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-macos
+          path: kestrel-agent.pkg
+          if-no-files-found: error
+  server:
+    # Native packages require glibc >= 2.35; the container is the portable option.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -f Dockerfile.server -t kestrel-server .
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler ruby-dev rpm
+      - run: npm ci && npm run build
+        working-directory: web
+      - run: cargo build --locked --release -p kestrel-server -p kestrel-cli
+      - run: sudo gem install fpm --no-document
+      - name: Native server packages
+        shell: bash
+        run: |
+          mkdir -p pkgroot/usr/bin artifacts
+          cp target/release/kestrel-server target/release/kestrel pkgroot/usr/bin/
+          for format in deb rpm; do
+            fpm -s dir -t "$format" -n kestrel-server -v 0.0.1 --license MIT --depends openssl -C pkgroot -p artifacts/ .
+          done
+          docker --context default build -f Dockerfile.server -t kestrel-server:0.0.1 .
+          docker --context default save kestrel-server:0.0.1 | gzip > artifacts/kestrel-server-image.tar.gz
+          cd artifacts
+          sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server
+          path: artifacts/*
+          if-no-files-found: error

@@ -1,4 +1,5 @@
-compose := "docker compose -f deploy/dev/docker-compose.yml"
+docker_context := env_var_or_default("KESTREL_DOCKER_CONTEXT", "default")
+compose := "docker --context " + docker_context + " compose -p kestrel-dev -f deploy/dev/docker-compose.yml"
 
 # Start PostgreSQL 16, VictoriaMetrics and Mailpit.
 dev-up:

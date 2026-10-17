@@ -1,8 +1,8 @@
 //! Mounted filesystem capacity. Pseudo filesystems are skipped unless asked for.
 
-use crate::metrics::{FILESYSTEM_FREE_BYTES, FILESYSTEM_SIZE_BYTES};
+use crate::metrics::{FILESYSTEM_FREE_BYTES, FILESYSTEM_SIZE_BYTES, FILESYSTEM_USED_RATIO};
 use crate::{sample, CollectError, Collector, Sample, DEFAULT_INTERVAL};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::Disks;
 
 const PSEUDO_FS: &[&str] = &["tmpfs", "overlay", "squashfs", "proc", "sysfs"];
@@ -11,6 +11,7 @@ pub struct FilesystemCollector {
     disks: Disks,
     include_pseudo: bool,
     interval: Duration,
+    last_discovery: Instant,
 }
 
 impl FilesystemCollector {
@@ -23,6 +24,7 @@ impl FilesystemCollector {
             disks: Disks::new_with_refreshed_list(),
             include_pseudo,
             interval: DEFAULT_INTERVAL,
+            last_discovery: Instant::now(),
         }
     }
 }
@@ -53,6 +55,12 @@ impl Collector for FilesystemCollector {
     }
 
     fn collect(&mut self, now_ms: i64) -> Result<Vec<Sample>, CollectError> {
+        // Mount discovery can be expensive (especially with network mounts).
+        // Keep the normal metric tick cheap while detecting hotplug within a minute.
+        if self.last_discovery.elapsed() >= Duration::from_secs(60) {
+            self.disks.refresh_list();
+            self.last_discovery = Instant::now();
+        }
         self.disks.refresh();
         let mut samples = Vec::new();
         for disk in self.disks.list() {
@@ -81,6 +89,12 @@ impl Collector for FilesystemCollector {
                 now_ms,
             ));
             samples.push(sample(FILESYSTEM_SIZE_BYTES, &labels, size as f64, now_ms));
+            samples.push(sample(
+                FILESYSTEM_USED_RATIO,
+                &labels,
+                1.0 - disk.available_space().min(size) as f64 / size as f64,
+                now_ms,
+            ));
         }
         Ok(samples)
     }

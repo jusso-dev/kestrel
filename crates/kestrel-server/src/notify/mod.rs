@@ -58,27 +58,124 @@ pub fn render(
     url: &str,
     status: &str,
 ) -> Result<Rendered, NotifyError> {
+    render_for_target(
+        problem,
+        problem,
+        host,
+        trigger,
+        value,
+        url,
+        status,
+        &json!({}),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_for_target(
+    problem_id: &str,
+    problem: &str,
+    host: &str,
+    trigger: &str,
+    value: &str,
+    url: &str,
+    status: &str,
+    target: &Value,
+) -> Result<Rendered, NotifyError> {
     let mut env = Environment::new();
-    env.add_template("default", DEFAULT_TEMPLATE)
+    env.set_recursion_limit(32);
+    env.set_fuel(Some(100_000));
+    let body_template = target
+        .get("body_template")
+        .or_else(|| target.get("template"))
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_TEMPLATE);
+    let subject_template = target
+        .get("subject_template")
+        .and_then(Value::as_str)
+        .unwrap_or("{{ problem.name }} on {{ host }}");
+    if body_template.len() > 16_384 || subject_template.len() > 4_096 {
+        return Err(NotifyError::new("notification template too large"));
+    }
+    validate_template(body_template)?;
+    validate_template(subject_template)?;
+    env.add_template("default", body_template)
         .map_err(|err| NotifyError::new(err.to_string()))?;
-    let template = env
-        .get_template("default")
+    env.add_template("subject", subject_template)
         .map_err(|err| NotifyError::new(err.to_string()))?;
-    let body = template
-        .render(context! {
-            problem => context! { name => problem, status => status },
-            host => host,
-            trigger => trigger,
-            value => value,
-            url => url,
-        })
-        .map_err(|err| NotifyError::new(err.to_string()))?;
+    let variables = context! {
+        problem => context! { id => problem_id, name => problem, status => status },
+        host => host,
+        trigger => trigger,
+        value => value,
+        url => url,
+    };
+    let body = render_limited(&env, "default", variables.clone(), 65_536)?;
+    let subject = render_limited(&env, "subject", variables, 4_096)?;
     Ok(Rendered {
-        subject: format!("{problem} on {host}"),
+        subject,
         body,
-        problem_id: problem.to_string(),
+        problem_id: problem_id.to_string(),
         status: status.to_string(),
     })
+}
+
+fn render_limited(
+    env: &Environment<'_>,
+    name: &str,
+    variables: minijinja::Value,
+    limit: usize,
+) -> Result<String, NotifyError> {
+    struct Output {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("notification output limit"));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = Output {
+        bytes: Vec::new(),
+        limit,
+    };
+    env.get_template(name)
+        .map_err(|err| NotifyError::new(err.to_string()))?
+        .render_captured_to(variables, &mut output)
+        .map_err(|_| NotifyError::new("notification template rendering failed"))?;
+    String::from_utf8(output.bytes).map_err(|_| NotifyError::new("invalid notification output"))
+}
+
+// Interpolation covers the documented notification variables without allowing
+// function/filter calls or arithmetic that can allocate before fuel is charged.
+fn validate_template(mut template: &str) -> Result<(), NotifyError> {
+    if template.contains("{%") || template.contains("{#") {
+        return Err(NotifyError::new(
+            "notification templates support variable interpolation only",
+        ));
+    }
+    while let Some(start) = template.find("{{") {
+        let tail = &template[start + 2..];
+        let end = tail
+            .find("}}")
+            .ok_or_else(|| NotifyError::new("unclosed notification variable"))?;
+        if !matches!(
+            tail[..end].trim(),
+            "problem.id" | "problem.name" | "problem.status" | "host" | "trigger" | "value" | "url"
+        ) {
+            return Err(NotifyError::new(
+                "unsupported notification variable or expression",
+            ));
+        }
+        template = &tail[end + 2..];
+    }
+    Ok(())
 }
 
 pub fn sign_body(secret: &[u8], body: &[u8]) -> String {
@@ -329,6 +426,27 @@ pub async fn send_smtp(msg: &Rendered, target: &Value) -> Result<(), NotifyError
         .map_err(|err| NotifyError::new(err.to_string()))
 }
 
+/// Apply the server SMTP defaults while preserving per-media overrides.
+pub fn with_smtp_defaults(mut target: Value, smtp: Option<&crate::config::SmtpConfig>) -> Value {
+    if let (Some(object), Some(smtp)) = (target.as_object_mut(), smtp) {
+        for (key, value) in [
+            ("smtp_host", json!(smtp.host)),
+            ("smtp_port", json!(smtp.port)),
+            ("from", json!(smtp.from)),
+            ("starttls", json!(smtp.starttls)),
+        ] {
+            object.entry(key).or_insert(value);
+        }
+        if let Some(user) = &smtp.username {
+            object.entry("username").or_insert(json!(user));
+        }
+        if let Some(password) = &smtp.password {
+            object.entry("password").or_insert(json!(password));
+        }
+    }
+    target
+}
+
 #[derive(Default)]
 pub struct RecordingMail {
     pub sent: Mutex<Vec<Rendered>>,
@@ -412,6 +530,41 @@ mod tests {
             status,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn per_media_templates_have_context_and_bounded_execution() {
+        let target = json!({"body_template":"{{ problem.id }} {{ trigger }} {{ value }} {{ url }}", "subject_template":"{{ problem.status }}: {{ host }}"});
+        let message = render_for_target(
+            "id-42",
+            "disk",
+            "web-1",
+            "disk full",
+            "95",
+            "https://monitor.example",
+            "problem",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(message.subject, "problem: web-1");
+        assert_eq!(message.body, "id-42 disk full 95 https://monitor.example");
+        let hostile = json!({"body_template":"{% for i in range(100000000) %}x{% endfor %}"});
+        assert!(
+            render_for_target("id", "disk", "web", "disk", "95", "url", "problem", &hostile)
+                .is_err()
+        );
+        let allocation = json!({"body_template":"{{ 'x' * 1000000000 }}"});
+        assert!(render_for_target(
+            "id",
+            "disk",
+            "web",
+            "disk",
+            "95",
+            "url",
+            "problem",
+            &allocation
+        )
+        .is_err());
     }
 
     #[test]
@@ -512,5 +665,50 @@ mod tests {
         apply_attempt(&mut jobs[0], Err("still down".to_string()), 100);
         assert_eq!(jobs[0].status, "failed");
         assert_eq!(jobs[0].attempts, 10);
+    }
+
+    #[tokio::test]
+    async fn notify_smtp_delivers_to_mailpit() {
+        let (Ok(smtp), Ok(api)) = (
+            std::env::var("KESTREL_TEST_SMTP"),
+            std::env::var("KESTREL_TEST_MAILPIT"),
+        ) else {
+            eprintln!("KESTREL_TEST_SMTP/KESTREL_TEST_MAILPIT unset; skipping external SMTP test");
+            return;
+        };
+        let (host, port) = smtp.rsplit_once(':').expect("SMTP host:port");
+        let unique = format!("kestrel-mail-{}", Uuid::new_v4());
+        let msg = render(
+            &unique,
+            "test-host",
+            "disk",
+            "95",
+            "https://monitor.example/problems",
+            "problem",
+        )
+        .unwrap();
+        send_smtp(&msg,&json!({"smtp_host":host,"smtp_port":port.parse::<u16>().unwrap(),"from":"kestrel@example.test","to":"ops@example.test","starttls":false})).await.unwrap();
+        let client = reqwest::Client::new();
+        let mut received = false;
+        for _ in 0..30 {
+            let result: Value = client
+                .get(format!("{api}/api/v1/search"))
+                .query(&[("query", unique.as_str())])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if result["messages"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(received, "message must arrive in Mailpit");
     }
 }

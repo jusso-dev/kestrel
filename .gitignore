@@ -3,3 +3,6 @@
 /deploy/dev/data/
 web/node_modules/
 web/.svelte-kit/
+/agent-local.toml
+/kestrel-enrol-token
+/kestrel-dev-ca.crt

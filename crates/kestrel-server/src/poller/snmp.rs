@@ -4,8 +4,8 @@
 
 use crate::config_compile::{template_from_yaml, TemplateDoc};
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const IF_TABLE: &str = "1.3.6.1.2.1.2.2.1";
@@ -39,7 +39,7 @@ pub struct SnmpTarget {
     pub version: SnmpVersion,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum SnmpVersion {
     V2c {
         community: String,
@@ -49,6 +49,15 @@ pub enum SnmpVersion {
         auth: String,
         privacy: String,
     },
+}
+
+impl std::fmt::Debug for SnmpVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::V2c { .. } => "V2c { credentials: [redacted] }",
+            Self::V3 { .. } => "V3 { credentials: [redacted] }",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,31 +115,86 @@ impl SnmpPoller for BlockingPoller {
     async fn get(&self, target: &SnmpTarget, oid: &str) -> Result<SnmpVar, PollError> {
         let target = target.clone();
         let oid = oid.to_string();
-        tokio::task::spawn_blocking(move || session_get(&target, &oid))
-            .await
-            .map_err(|err| PollError::new(err.to_string()))?
+        run_blocking(move || session_get(&target, &oid)).await
     }
 
     async fn walk(&self, target: &SnmpTarget, oid: &str) -> Result<Vec<SnmpVar>, PollError> {
         let target = target.clone();
         let oid = oid.to_string();
-        tokio::task::spawn_blocking(move || session_walk(&target, &oid))
-            .await
-            .map_err(|err| PollError::new(err.to_string()))?
+        run_blocking(move || session_walk(&target, &oid)).await
     }
+}
+
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, PollError> + Send + 'static,
+) -> Result<T, PollError> {
+    let permit = blocking_permit().await?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // snmp2's inline packet buffers and v3 session initialization exceed a
+    // default Tokio worker stack in debug builds. Isolate socket work on a
+    // sized stack, retaining the concurrency permit even if its caller cancels.
+    std::thread::Builder::new()
+        .name("kestrel-snmp".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let _permit = permit;
+            let _ = tx.send(work());
+        })
+        .map_err(|_| PollError::new("could not start SNMP worker"))?;
+    rx.await.map_err(|_| PollError::new("SNMP worker failed"))?
+}
+
+async fn blocking_permit() -> Result<OwnedSemaphorePermit, PollError> {
+    // A cancelled caller must not release its worker's permit while a socket
+    // operation is still running, otherwise timed-out walks evade the cap.
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT
+        .get_or_init(|| Arc::new(Semaphore::new(DEFAULT_PERMITS)))
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| PollError::new("SNMP worker pool closed"))
 }
 
 #[allow(dead_code)]
 fn session_get(target: &SnmpTarget, oid: &str) -> Result<SnmpVar, PollError> {
     let mut session = open_session(target)?;
     let parsed = parse_oid(oid)?;
-    let pdu = session
-        .get(&parsed)
-        .map_err(|err| PollError::new(err.to_string()))?;
-    Ok(SnmpVar {
-        oid: oid.to_string(),
-        value: format!("{pdu:?}"),
-    })
+    session_request(&mut session, &parsed, false)?
+        .ok_or_else(|| PollError::new("OID has no supported value"))
+}
+
+fn session_request(
+    session: &mut snmp2::SyncSession,
+    oid: &snmp2::Oid<'_>,
+    next: bool,
+) -> Result<Option<SnmpVar>, PollError> {
+    for attempt in 0..3 {
+        let result = if next {
+            session.getnext(oid)
+        } else {
+            session.get(oid)
+        };
+        match result {
+            Ok(mut pdu) => {
+                if pdu.error_status != 0 {
+                    return Err(PollError::new("device rejected SNMP request"));
+                }
+                let Some((oid, value)) = pdu.varbinds.next() else {
+                    return Ok(None);
+                };
+                return Ok(value_text(value).map(|value| SnmpVar {
+                    oid: oid.to_string(),
+                    value,
+                }));
+            }
+            // snmp2 updates engine boots/time from authenticated reports and
+            // explicitly requires retrying the PDU after AuthUpdated.
+            Err(snmp2::Error::AuthUpdated) if attempt < 2 => continue,
+            Err(err) => return Err(PollError::new(err.to_string())),
+        }
+    }
+    Err(PollError::new("SNMP security state did not settle"))
 }
 
 #[allow(dead_code)]
@@ -138,24 +202,42 @@ fn session_walk(target: &SnmpTarget, root: &str) -> Result<Vec<SnmpVar>, PollErr
     let mut session = open_session(target)?;
     let mut current = parse_oid(root)?;
     let mut rows = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
     for _ in 0..10_000 {
-        let pdu = session
-            .getnext(&current)
-            .map_err(|err| PollError::new(err.to_string()))?;
-        let rendered = format!("{pdu:?}");
-        let Some(next) = first_dotted_oid(&rendered) else {
+        if Instant::now() >= deadline {
+            return Err(PollError::new("SNMP walk exceeded its deadline"));
+        }
+        let Some(row) = session_request(&mut session, &current, true)? else {
             break;
         };
-        if !next.starts_with(root) || next == current.to_string() {
+        let next = row.oid.clone();
+        if !(next == root || next.starts_with(&format!("{root}.")))
+            || oid_parts(&next) <= oid_parts(&current.to_string())
+        {
             break;
         }
-        rows.push(SnmpVar {
-            oid: next.clone(),
-            value: rendered,
-        });
+        rows.push(row);
         current = parse_oid(&next)?;
     }
     Ok(rows)
+}
+
+fn oid_parts(oid: &str) -> Vec<u64> {
+    oid.split('.').filter_map(|p| p.parse().ok()).collect()
+}
+
+fn value_text(value: snmp2::Value<'_>) -> Option<String> {
+    use snmp2::Value;
+    Some(match value {
+        Value::Integer(v) => v.to_string(),
+        Value::Counter32(v) | Value::Unsigned32(v) | Value::Timeticks(v) => v.to_string(),
+        Value::Counter64(v) => v.to_string(),
+        Value::Boolean(v) => if v { "1" } else { "0" }.into(),
+        Value::OctetString(v) => String::from_utf8_lossy(v).into_owned(),
+        Value::ObjectIdentifier(v) => v.to_string(),
+        Value::IpAddress(v) => std::net::Ipv4Addr::from(v).to_string(),
+        _ => return None,
+    })
 }
 
 #[allow(dead_code)]
@@ -174,13 +256,19 @@ fn open_session(target: &SnmpTarget) -> Result<snmp2::SyncSession, PollError> {
             privacy,
         } => {
             let security = v3_security(user, auth, privacy)?;
-            snmp2::SyncSession::new_v3(
+            let mut session = snmp2::SyncSession::new_v3(
                 target.addr.as_str(),
                 Some(Duration::from_secs(2)),
                 0,
                 security,
             )
-            .map_err(|err| PollError::new(err.to_string()))
+            .map_err(|err| PollError::new(err.to_string()))?;
+            // Discover authoritative engine ID/boots/time and localize keys
+            // before the first authenticated, encrypted PDU.
+            session
+                .init()
+                .map_err(|err| PollError::new(err.to_string()))?;
+            Ok(session)
         }
     }
 }
@@ -197,7 +285,7 @@ pub fn v3_security(
         snmp2::v3::Security::new(user.as_bytes(), auth_password.as_bytes())
             .with_auth_protocol(snmp2::v3::AuthProtocol::Sha256)
             .with_auth(snmp2::v3::Auth::AuthPriv {
-                cipher: snmp2::v3::Cipher::Aes256,
+                cipher: snmp2::v3::Cipher::Aes128,
                 privacy_password: privacy_password.as_bytes().to_vec(),
             }),
     )
@@ -222,23 +310,6 @@ fn parse_oid(text: &str) -> Result<snmp2::Oid<'static>, PollError> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     snmp2::Oid::from(parts.as_slice()).map_err(|err| PollError::new(format!("oid: {err:?}")))
-}
-
-#[allow(dead_code)]
-fn first_dotted_oid(text: &str) -> Option<String> {
-    let mut current = String::new();
-    let mut best: Option<String> = None;
-    for ch in text.chars() {
-        if ch.is_ascii_digit() || (ch == '.' && !current.is_empty()) {
-            current.push(ch);
-        } else if current.matches('.').count() >= 2 {
-            best = Some(current.trim_end_matches('.').to_string());
-            break;
-        } else {
-            current.clear();
-        }
-    }
-    best
 }
 
 pub fn snmp_templates() -> Vec<TemplateDoc> {
@@ -287,6 +358,26 @@ mod tests {
         assert!(names.iter().any(|name| name.contains("UPS-MIB")));
     }
 
+    #[test]
+    fn snmp_decodes_numeric_values_and_redacts_credentials() {
+        assert_eq!(
+            value_text(snmp2::Value::Counter64(4294967300)).as_deref(),
+            Some("4294967300")
+        );
+        assert_eq!(
+            value_text(snmp2::Value::OctetString(b"uplink")).as_deref(),
+            Some("uplink")
+        );
+        assert!(value_text(snmp2::Value::EndOfMibView).is_none());
+        let version = SnmpVersion::V3 {
+            user: "fixture-user".into(),
+            auth: "fixture-auth".into(),
+            privacy: "fixture-privacy".into(),
+        };
+        let debug = format!("{version:?}");
+        assert!(!debug.contains("fixture"));
+    }
+
     #[tokio::test]
     async fn snmp_timeout_releases_the_permit() {
         let pool = TimeoutPool::new(1);
@@ -321,11 +412,45 @@ mod tests {
     async fn snmp_walks_snmpsim() {
         let poller = BlockingPoller;
         let target = SnmpTarget {
-            addr: "127.0.0.1:1161".to_string(),
+            addr: std::env::var("SNMPSIM_ADDR").unwrap_or_else(|_| "127.0.0.1:1161".into()),
             version: SnmpVersion::V2c {
                 community: "public".to_string(),
             },
         };
-        let _ = poller.get(&target, "1.3.6.1.2.1.1.1.0").await.unwrap();
+        let value = poller.get(&target, "1.3.6.1.2.1.1.3.0").await.unwrap();
+        assert!(value.value.parse::<u64>().unwrap() > 0);
+        let rows = poller.walk(&target, IF_X_TABLE).await.unwrap();
+        assert!(rows.iter().any(|row| row.value == "uplink"));
+        assert!(rows.iter().any(|row| row.value == "4294967300"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an isolated simulator and SNMPSIM_AUTH_FILE; use scripts/test-snmp.sh"]
+    async fn snmp_v3_authpriv_snmpsim() {
+        let path = std::env::var("SNMPSIM_AUTH_FILE")
+            .expect("SNMPSIM_AUTH_FILE must point to the protected fixture credentials");
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let field = |name: &str| {
+            fixture[name]
+                .as_str()
+                .expect("invalid simulator fixture")
+                .to_string()
+        };
+        let target = SnmpTarget {
+            addr: field("addr"),
+            version: SnmpVersion::V3 {
+                user: field("user"),
+                auth: field("auth"),
+                privacy: field("privacy"),
+            },
+        };
+        let value = BlockingPoller
+            .get(&target, "1.3.6.1.2.1.1.3.0")
+            .await
+            .unwrap();
+        assert_eq!(value.value, "12345");
+        let rows = BlockingPoller.walk(&target, IF_X_TABLE).await.unwrap();
+        assert!(rows.iter().any(|row| row.value == "4294967300"));
     }
 }

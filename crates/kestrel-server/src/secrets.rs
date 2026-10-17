@@ -13,6 +13,7 @@ pub struct SecretBox {
 impl SecretBox {
     pub fn load_or_create(path: &Path) -> Result<Self, crate::ServerError> {
         if path.is_file() {
+            crate::perms::restrict_private_key(path)?;
             let text = std::fs::read_to_string(path)?;
             let identity = text
                 .trim()

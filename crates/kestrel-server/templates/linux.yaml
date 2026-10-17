@@ -26,6 +26,6 @@ triggers:
     severity: high
     for_seconds: 180
   - name: Load is high
-    expression: kestrel_cpu_load1 > 8
+    expression: kestrel_load1 > 8
     severity: warning
     for_seconds: 300

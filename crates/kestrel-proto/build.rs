@@ -6,13 +6,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("PROTOC", &protoc);
     }
     // prost's Message derive already implements Debug.
-    prost_build::Config::new().compile_protos(
-        &[
-            "proto/kestrel.proto",
-            "proto/remote.proto",
-            "proto/otlp.proto",
-        ],
-        &["proto"],
-    )?;
+    prost_build::Config::new()
+        .type_attribute(
+            "kestrel.v1.AgentConfig",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .type_attribute("kestrel.v1.AgentConfig", "#[serde(default)]")
+        .type_attribute(
+            "kestrel.v1.CheckSpec",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .type_attribute(
+            "kestrel.v1.LogSpec",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .type_attribute(
+            "kestrel.v1.ItemSpec",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
+        )
+        .compile_protos(
+            &[
+                "proto/kestrel.proto",
+                "proto/remote.proto",
+                "proto/otlp.proto",
+            ],
+            &["proto"],
+        )?;
     Ok(())
 }

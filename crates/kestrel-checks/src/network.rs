@@ -5,12 +5,13 @@ use crate::metrics::{
     NETWORK_TRANSMIT_BYTES_TOTAL, NETWORK_TRANSMIT_ERRORS_TOTAL, NETWORK_TRANSMIT_PACKETS_TOTAL,
 };
 use crate::{sample, CollectError, Collector, Sample, DEFAULT_INTERVAL};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::Networks;
 
 pub struct NetworkCollector {
     networks: Networks,
     interval: Duration,
+    last_discovery: Instant,
 }
 
 impl NetworkCollector {
@@ -18,6 +19,7 @@ impl NetworkCollector {
         Self {
             networks: Networks::new_with_refreshed_list(),
             interval: DEFAULT_INTERVAL,
+            last_discovery: Instant::now(),
         }
     }
 }
@@ -38,6 +40,10 @@ impl Collector for NetworkCollector {
     }
 
     fn collect(&mut self, now_ms: i64) -> Result<Vec<Sample>, CollectError> {
+        if self.last_discovery.elapsed() >= Duration::from_secs(60) {
+            self.networks.refresh_list();
+            self.last_discovery = Instant::now();
+        }
         self.networks.refresh();
         let mut samples = Vec::new();
         for (iface, data) in &self.networks {

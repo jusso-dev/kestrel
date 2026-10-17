@@ -8,6 +8,7 @@ use crate::sample;
 use kestrel_proto::{CheckState, Sample};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 pub const STDOUT_CAP: usize = 4 * 1024;
@@ -115,17 +116,33 @@ pub async fn run_command(
 ) -> Result<CommandOutput, CommandError> {
     let exe = resolve_executable(&check.command, plugin_dirs)?;
     let args = &check.command[1..];
-    let child = Command::new(&exe)
+    let mut child = match Command::new(&exe)
         .args(args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| CommandError::new(format!("could not start command: {err}")))?;
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return Ok(unknown(
+                check,
+                &format!("could not start command: {err}"),
+                now_ms,
+            ))
+        }
+    };
     let timeout = check.timeout.max(Duration::from_millis(1));
-    let collected = tokio::time::timeout(timeout, child.wait_with_output()).await;
-    let output = match collected {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    // Drain both pipes concurrently, retaining only the cap. wait_with_output
+    // would buffer arbitrary plugin output in memory before truncating it.
+    let collected = tokio::time::timeout(timeout, async {
+        tokio::try_join!(child.wait(), read_capped(stdout), read_capped(stderr))
+    })
+    .await;
+    let (status, stdout, stderr) = match collected {
         Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             return Ok(unknown(
@@ -134,13 +151,16 @@ pub async fn run_command(
                 now_ms,
             ))
         }
-        Err(_) => return Ok(unknown(check, "timed out", now_ms)),
+        Err(_) => {
+            let _ = child.kill().await;
+            return Ok(unknown(check, "timed out", now_ms));
+        }
     };
-    let code = output.status.code().unwrap_or(3);
+    let code = status.code().unwrap_or(3);
     let state = CheckState::from_exit_code(code);
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut text = String::from_utf8_lossy(&stdout).into_owned();
     if text.is_empty() {
-        text = String::from_utf8_lossy(&output.stderr).into_owned();
+        text = String::from_utf8_lossy(&stderr).into_owned();
     }
     let text = cap_output(&text);
     let (summary, perfdata) = split_output(&text);
@@ -152,6 +172,20 @@ pub async fn run_command(
         perfdata: perfdata.to_string(),
         samples,
     })
+}
+
+async fn read_capped(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+    let mut retained = Vec::with_capacity(STDOUT_CAP);
+    let mut chunk = [0u8; 4096];
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let keep = count.min(STDOUT_CAP.saturating_sub(retained.len()));
+        retained.extend_from_slice(&chunk[..keep]);
+    }
+    Ok(retained)
 }
 
 fn unknown(check: &CommandCheck, output: &str, now_ms: i64) -> CommandOutput {
@@ -212,6 +246,14 @@ fn samples_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn command_drains_output_without_retaining_more_than_the_cap() {
+        let bytes = read_capped(tokio::io::repeat(b'x').take((STDOUT_CAP * 100) as u64))
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), STDOUT_CAP);
+    }
 
     fn plugin_dir(label: &str) -> PathBuf {
         let dir =

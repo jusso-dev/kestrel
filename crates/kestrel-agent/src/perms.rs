@@ -8,7 +8,7 @@ pub fn write_private_key(path: &Path, pem: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("key.tmp");
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     write_secret(&tmp, pem)?;
     replace_file(&tmp, path)?;
     restrict_private_key(path)
@@ -44,8 +44,7 @@ fn write_secret(path: &Path, pem: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(path)?;
         file.write_all(pem.as_bytes())?;
@@ -54,7 +53,16 @@ fn write_secret(path: &Path, pem: &str) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        std::fs::write(path, pem)?;
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        // Apply the ACL while the temporary file is still empty. Secrets
+        // never inherit ProgramData's broad read permissions, even briefly.
+        restrict_private_key(path)?;
+        file.write_all(pem.as_bytes())?;
+        file.sync_all()?;
         Ok(())
     }
 }

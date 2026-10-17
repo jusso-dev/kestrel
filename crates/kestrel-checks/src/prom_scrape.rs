@@ -3,6 +3,56 @@
 
 use kestrel_proto::Sample;
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+/// Scrape an HTTP endpoint with a time and body bound, retaining valid finite
+/// observations when an exporter reports NaN for unavailable measurements.
+pub async fn scrape_prometheus(
+    url: &str,
+    job: &str,
+    instance: &str,
+    timeout: Duration,
+    now_ms: i64,
+) -> Result<Vec<Sample>, String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "invalid scrape URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("scrape URL must use HTTP(S) without embedded credentials".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(timeout.max(Duration::from_millis(1)))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| err.to_string())?;
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| err.without_url().to_string())?
+        .error_for_status()
+        .map_err(|err| err.without_url().to_string())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| err.without_url().to_string())?
+    {
+        if body.len() + chunk.len() > 16 * 1024 * 1024 {
+            return Err("scrape exceeds 16 MiB".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let parsed =
+        parse_exposition(std::str::from_utf8(&body).map_err(|_| "scrape body is not UTF-8")?)?;
+    let identity = if instance.is_empty() {
+        crate::http::metric_target(url)
+    } else {
+        instance.to_string()
+    };
+    Ok(to_agent_samples(&relabel(parsed, job, &identity), now_ms))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpositionSample {
@@ -46,9 +96,6 @@ fn parse_line(line: &str) -> Result<ExpositionSample, String> {
         .ok_or_else(|| "missing value".to_string())?
         .parse()
         .map_err(|_| "value is not a number".to_string())?;
-    if !value.is_finite() {
-        return Err("value is not finite".to_string());
-    }
     let timestamp_ms = match parts.next() {
         Some(raw) => Some(
             raw.parse::<i64>()
@@ -69,10 +116,19 @@ fn parse_line(line: &str) -> Result<ExpositionSample, String> {
 
 fn split_sample(line: &str) -> Result<(&str, &str), String> {
     let mut quoted = false;
+    let mut escaped = false;
+    let mut braces = 0u8;
     for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match ch {
+            '\\' if quoted => escaped = true,
             '"' => quoted = !quoted,
-            ' ' | '\t' if !quoted => {
+            '{' if !quoted => braces = braces.saturating_add(1),
+            '}' if !quoted => braces = braces.saturating_sub(1),
+            ' ' | '\t' if !quoted && braces == 0 => {
                 return Ok((line[..index].trim(), line[index..].trim()));
             }
             _ => {}
@@ -88,16 +144,11 @@ fn parse_labels(body: &str) -> Result<Vec<(String, String)>, String> {
     let mut labels = Vec::new();
     let mut rest = body.trim();
     while !rest.is_empty() {
-        rest = rest.trim_start().trim_start_matches(',');
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            break;
-        }
         let eq = rest
             .find('=')
             .ok_or_else(|| "label is missing '='".to_string())?;
         let name = rest[..eq].trim();
-        if !valid_name(name) {
+        if !valid_name(name) || name.contains(':') || labels.iter().any(|(key, _)| key == name) {
             return Err(format!("invalid label {name}"));
         }
         let after = rest[eq + 1..].trim_start();
@@ -107,6 +158,12 @@ fn parse_labels(body: &str) -> Result<Vec<(String, String)>, String> {
         let (value, next) = take_quoted(value_raw)?;
         labels.push((name.to_string(), value));
         rest = next.trim_start();
+        if !rest.is_empty() {
+            rest = rest
+                .strip_prefix(',')
+                .ok_or_else(|| "labels must be comma separated".to_string())?
+                .trim_start();
+        }
     }
     Ok(labels)
 }
@@ -120,7 +177,7 @@ fn take_quoted(input: &str) -> Result<(String, &str), String> {
                 Some('n') => value.push('\n'),
                 Some('\\') => value.push('\\'),
                 Some('"') => value.push('"'),
-                Some(other) => value.push(other),
+                Some(_) => return Err("invalid label escape".to_string()),
                 None => return Err("truncated escape".to_string()),
             }
         } else if ch == '"' {
@@ -141,21 +198,21 @@ fn valid_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':')
 }
 
-/// Add `job` and `instance` without replacing labels the target already set
-/// under a different name. Existing `job` or `instance` labels are kept and
-/// the scrape identity is added as `kestrel_job` only when the target already
-/// used the name. The operator-configured identity always wins for empty targets.
+/// Apply the configured scrape identity, preserving conflicting target labels
+/// under `exported_` names as Prometheus does when honor_labels is false.
 pub fn relabel(samples: Vec<ExpositionSample>, job: &str, instance: &str) -> Vec<ExpositionSample> {
     samples
         .into_iter()
         .map(|mut sample| {
-            if !sample.labels.iter().any(|(name, _)| name == "job") {
-                sample.labels.push(("job".to_string(), job.to_string()));
-            }
-            if !sample.labels.iter().any(|(name, _)| name == "instance") {
-                sample
-                    .labels
-                    .push(("instance".to_string(), instance.to_string()));
+            for (key, value) in [("job", job), ("instance", instance)] {
+                if let Some(index) = sample.labels.iter().position(|(name, _)| name == key) {
+                    let mut exported = format!("exported_{key}");
+                    while sample.labels.iter().any(|(name, _)| name == &exported) {
+                        exported = format!("exported_{exported}");
+                    }
+                    sample.labels[index].0 = exported;
+                }
+                sample.labels.push((key.into(), value.into()));
             }
             sample
         })
@@ -165,6 +222,9 @@ pub fn relabel(samples: Vec<ExpositionSample>, job: &str, instance: &str) -> Vec
 pub fn to_agent_samples(samples: &[ExpositionSample], now_ms: i64) -> Vec<Sample> {
     samples
         .iter()
+        // Kestrel's metric stores accept finite values. One missing exporter
+        // observation must not discard the other metrics in the scrape.
+        .filter(|sample| sample.value.is_finite())
         .map(|sample| Sample {
             name: sample.name.clone(),
             labels: sample.labels.clone(),
@@ -176,8 +236,22 @@ pub fn to_agent_samples(samples: &[ExpositionSample], now_ms: i64) -> Vec<Sample
 
 /// Render samples in Prometheus text format.
 pub fn encode_exposition(samples: &[Sample]) -> String {
+    let samples: Vec<&Sample> = samples
+        .iter()
+        .filter(|sample| {
+            valid_name(&sample.name)
+                && sample.value.is_finite()
+                && sample.labels.iter().enumerate().all(|(index, (key, _))| {
+                    valid_name(key)
+                        && !key.contains(':')
+                        && !sample.labels[..index]
+                            .iter()
+                            .any(|(previous, _)| previous == key)
+                })
+        })
+        .collect();
     let mut types: BTreeMap<&str, &str> = BTreeMap::new();
-    for sample in samples {
+    for sample in &samples {
         let kind = if sample.name.ends_with("_total") {
             "counter"
         } else {
@@ -187,6 +261,11 @@ pub fn encode_exposition(samples: &[Sample]) -> String {
     }
     let mut out = String::new();
     for (name, kind) in types {
+        out.push_str("# HELP ");
+        out.push_str(name);
+        out.push_str(" Latest observed value for ");
+        out.push_str(&name.replace('\\', "\\\\").replace('\n', "\\n"));
+        out.push_str(".\n");
         out.push_str("# TYPE ");
         out.push_str(name);
         out.push(' ');
@@ -270,6 +349,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prom_scrape_handles_escaped_labels_and_rejects_ambiguous_sets() {
+        let parsed = parse_exposition(r#"metric{path="a\" b", method="GET"} 1"#).unwrap();
+        assert_eq!(parsed[0].labels[0].1, "a\" b");
+        for bad in [
+            r#"metric{a="x" a="y"} 1"#,
+            r#"metric{a="x",a="y"} 1"#,
+            r#"metric{bad:key="x"} 1"#,
+            r#"metric{a="\t"} 1"#,
+        ] {
+            assert!(parse_exposition(bad).is_err(), "{bad}");
+        }
+        let parsed = parse_exposition("metric NaN\nother +Inf\nvalid 3\n").unwrap();
+        assert_eq!(to_agent_samples(&parsed, 1).len(), 1);
+        let parsed = relabel(
+            parse_exposition(r#"metric{job="spoof",instance="elsewhere"} 1"#).unwrap(),
+            "node",
+            "host",
+        );
+        assert!(parsed[0].labels.contains(&("job".into(), "node".into())));
+        assert!(parsed[0]
+            .labels
+            .contains(&("exported_job".into(), "spoof".into())));
+    }
+
+    #[test]
     fn prom_scrape_parses_node_exporter_style_text() {
         let text = r#"
 # HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.
@@ -304,5 +408,36 @@ node_filesystem_avail_bytes{mountpoint="/"} 1024
         let parsed = parse_exposition(&text).unwrap();
         assert_eq!(parsed[0].name, "kestrel_uptime_seconds");
         assert_eq!(parsed[0].value, 12.0);
+    }
+
+    #[test]
+    fn prom_encode_declares_help_and_type_once_for_each_metric_family() {
+        let samples = (0..2)
+            .map(|cpu| Sample {
+                name: "kestrel_cpu_usage_ratio".into(),
+                labels: vec![("cpu".into(), cpu.to_string())],
+                value: 0.5,
+                timestamp_ms: 123,
+            })
+            .collect::<Vec<_>>();
+        let text = encode_exposition(&samples);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("# HELP kestrel_cpu_usage_ratio "))
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| *line == "# TYPE kestrel_cpu_usage_ratio gauge")
+                .count(),
+            1
+        );
+        assert_eq!(
+            text.lines().filter(|line| !line.starts_with('#')).count(),
+            2
+        );
+        validate_exposition(&text).unwrap();
+        assert_eq!(parse_exposition(&text).unwrap().len(), 2);
     }
 }

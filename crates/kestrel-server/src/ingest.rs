@@ -2,7 +2,7 @@
 
 use crate::store::{LabelledSample, MetricStore};
 use kestrel_proto::v1::{self, Batch};
-use kestrel_proto::{decode_batch, CheckState, DEFAULT_MAX_DECOMPRESSED};
+use kestrel_proto::{decode_batch, CheckState};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -121,9 +121,17 @@ async fn flush(store: &Arc<dyn MetricStore>, pending: &mut Vec<LabelledSample>) 
     if pending.is_empty() {
         return;
     }
-    let batch = std::mem::take(pending);
-    if let Err(err) = store.write(batch).await {
-        tracing::warn!(error = %err, "metric write failed");
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        match store.write(pending.clone()).await {
+            Ok(()) => {
+                pending.clear();
+                return;
+            }
+            Err(err) => tracing::warn!(error=%err,"metric write failed; retaining batch for retry"),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(std::time::Duration::from_secs(30));
     }
 }
 
@@ -133,8 +141,17 @@ pub fn prepare_batch(
     host: &str,
     agent: &str,
 ) -> Result<PreparedBatch, IngestDecision> {
-    let batch = decode_batch(bytes, DEFAULT_MAX_DECOMPRESSED)
+    let batch = decode_batch(bytes, INGEST_BODY_LIMIT)
         .map_err(|err| IngestDecision::Rejected(format!("could not decode batch: {err}")))?;
+    if batch.samples.len() > 100_000
+        || batch.checks.len() > 10_000
+        || batch.logs.len() > 10_000
+        || batch.samples.iter().any(|sample| sample.labels.len() > 30)
+    {
+        return Err(IngestDecision::Rejected(
+            "batch has too many observations or labels".to_string(),
+        ));
+    }
     Ok(label_batch(batch, tenant, host, agent))
 }
 
@@ -208,7 +225,10 @@ fn label_sample(
 ) -> LabelledSample {
     let mut out = base_labels(tenant, host, agent);
     for label in labels {
-        if matches!(label.name.as_str(), "tenant" | "host" | "agent") {
+        if matches!(
+            label.name.as_str(),
+            "tenant" | "host" | "agent" | "__name__"
+        ) {
             continue;
         }
         out.push((label.name, label.value));
@@ -270,14 +290,10 @@ pub fn partition_is_expired(name: &str, today: &str, keep_days: i64) -> bool {
 }
 
 fn day_number(yyyymmdd: &str) -> Option<i64> {
-    let mut parts = yyyymmdd.split('_');
-    let year: i64 = parts.next()?.parse().ok()?;
-    let month: i64 = parts.next()?.parse().ok()?;
-    let day: i64 = parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(year * 372 + month * 31 + day)
+    use chrono::Datelike;
+    chrono::NaiveDate::parse_from_str(yyyymmdd, "%Y_%m_%d")
+        .ok()
+        .map(|date| i64::from(date.num_days_from_ce()))
 }
 
 #[cfg(test)]
@@ -314,6 +330,25 @@ mod tests {
             }],
             inventory: None,
         })
+    }
+
+    #[test]
+    fn log_retention_uses_calendar_days_across_months_and_leap_years() {
+        assert!(!partition_is_expired(
+            "log_events_2024_02_29",
+            "log_events_2024_03_07",
+            7
+        ));
+        assert!(partition_is_expired(
+            "log_events_2024_02_28",
+            "log_events_2024_03_07",
+            7
+        ));
+        assert!(!partition_is_expired(
+            "log_events_2024_02_31",
+            "log_events_2024_03_07",
+            7
+        ));
     }
 
     #[test]

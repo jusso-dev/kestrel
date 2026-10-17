@@ -1,5 +1,6 @@
 [Unit]
 Description=Kestrel monitoring agent
+Wants=network-online.target
 After=network-online.target
 
 [Service]
@@ -7,6 +8,7 @@ User=kestrel
 Group=kestrel
 ExecStart=/usr/local/bin/kestrel-agent --config /etc/kestrel/agent.toml
 Restart=on-failure
+RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

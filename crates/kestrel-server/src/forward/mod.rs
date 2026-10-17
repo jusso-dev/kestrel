@@ -157,6 +157,65 @@ pub async fn send_syslog(addr: std::net::SocketAddr, msg: &str) -> Result<(), Fo
     Ok(())
 }
 
+/// RFC 5425 with certificate and hostname verification against public roots.
+/// A timeout covers DNS, connect, TLS negotiation and write.
+pub async fn send_syslog_tls(host: &str, port: u16, body: &str) -> Result<(), ForwardError> {
+    send_syslog_tls_with_ca(host, port, body, None).await
+}
+
+pub async fn send_syslog_tls_with_ca(
+    host: &str,
+    port: u16,
+    body: &str,
+    ca_pem: Option<&str>,
+) -> Result<(), ForwardError> {
+    let mut roots =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(pem) = ca_pem {
+        let mut reader = pem.as_bytes();
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| ForwardError::new("invalid syslog CA PEM"))?;
+        if certs.is_empty() {
+            return Err(ForwardError::new("empty syslog CA PEM"));
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|_| ForwardError::new("invalid syslog CA certificate"))?;
+        }
+    }
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| ForwardError::new(err.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|_| ForwardError::new("invalid syslog TLS hostname"))?;
+    let message = rfc5424("kestrel", "kestrel", body, chrono::Utc::now());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let tcp = tokio::net::TcpStream::connect((host, port))
+            .await
+            .map_err(|_| ForwardError::new("syslog TCP connection failed"))?;
+        let mut stream = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+            .connect(name, tcp)
+            .await
+            .map_err(|_| ForwardError::new("syslog TLS handshake failed"))?;
+        stream
+            .write_all(&octet_count(&message))
+            .await
+            .map_err(|_| ForwardError::new("syslog write failed"))?;
+        stream
+            .shutdown()
+            .await
+            .map_err(|_| ForwardError::new("syslog shutdown failed"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| ForwardError::new("syslog delivery timed out"))?
+}
+
 #[derive(Debug, Clone)]
 pub struct ForwardJob {
     pub id: Uuid,
@@ -188,6 +247,48 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn syslog_tls_verifies_ca_and_delivers_octet_counted_events() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let ca = cert.cert.pem();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()).into(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let task = tokio::spawn(async move {
+            // The first connection must fail certificate validation.
+            let (socket, _) = listener.accept().await.unwrap();
+            assert!(acceptor.accept(socket).await.is_err());
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(socket).await.unwrap();
+            let mut body = Vec::new();
+            stream.read_to_end(&mut body).await.unwrap();
+            body
+        });
+        assert!(send_syslog_tls("localhost", port, "not trusted")
+            .await
+            .is_err());
+        send_syslog_tls_with_ca("localhost", port, "trusted finding", Some(&ca))
+            .await
+            .unwrap();
+        let body = task.await.unwrap();
+        let text = String::from_utf8(body).unwrap();
+        let (count, message) = text.split_once(' ').unwrap();
+        assert_eq!(count.parse::<usize>().unwrap(), message.len());
+        assert!(message.contains("<134>1"));
+        assert!(message.ends_with("trusted finding"));
+    }
 
     #[tokio::test]
     async fn forward_reaches_syslog_and_wedgetail_without_blocking_retries() {

@@ -4,6 +4,9 @@
 //! [`AuthKind`]. Passwords and tokens are not written to logs.
 
 mod memory;
+mod postgres;
+#[cfg(test)]
+mod postgres_tests;
 
 pub use memory::{session_cookie, MemoryCatalog, Principal};
 
@@ -26,19 +29,9 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio_stream::StreamExt;
-use utoipa::OpenApi;
 use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "kestrel_session";
-
-#[derive(OpenApi)]
-#[openapi(info(
-    title = "Kestrel API",
-    description = "Monitoring API. Tenant scope is taken from the session, not the client query.",
-    version = "0.0.1"
-))]
-struct ApiDoc;
 
 #[derive(Clone, Copy)]
 enum Location {
@@ -54,7 +47,202 @@ pub(crate) struct RouteSpec {
     location: Location,
 }
 
+macro_rules! resource_route {
+    ($method:literal,$path:literal,$operation:literal,$permission:ident) => {
+        RouteSpec {
+            method: $method,
+            path: $path,
+            operation: $operation,
+            auth: AuthKind::User(Permission::$permission),
+            location: Location::Api,
+        }
+    };
+}
+
 pub(crate) const ROUTES: &[RouteSpec] = &[
+    resource_route!("PUT", "/api/v1/tenants/{id}", "update_tenant", TenantAdmin),
+    resource_route!(
+        "POST",
+        "/api/v1/templates/{id}/parents",
+        "link_parent",
+        TemplateWrite
+    ),
+    resource_route!(
+        "POST",
+        "/api/v1/enrolment-tokens",
+        "create_enrolment_token",
+        HostWrite
+    ),
+    resource_route!(
+        "GET",
+        "/api/v1/discovery-rules",
+        "list_discovery_rules",
+        TemplateRead
+    ),
+    resource_route!(
+        "POST",
+        "/api/v1/discovery-rules",
+        "create_discovery_rule",
+        TemplateWrite
+    ),
+    resource_route!(
+        "GET",
+        "/api/v1/discovery-rules/{id}",
+        "get_resource",
+        TemplateRead
+    ),
+    resource_route!(
+        "PUT",
+        "/api/v1/discovery-rules/{id}",
+        "update_resource",
+        TemplateWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/discovery-rules/{id}",
+        "delete_resource",
+        TemplateWrite
+    ),
+    resource_route!("GET", "/api/v1/hosts/{id}/snmp", "get_snmp", HostRead),
+    resource_route!("PUT", "/api/v1/hosts/{id}/snmp", "put_snmp", HostWrite),
+    resource_route!("POST", "/api/v1/tenants", "create_tenant", TenantAdmin),
+    resource_route!("PUT", "/api/v1/hosts/{id}", "update_resource", HostWrite),
+    resource_route!("DELETE", "/api/v1/hosts/{id}", "delete_resource", HostWrite),
+    resource_route!("GET", "/api/v1/host-groups/{id}", "get_resource", GroupRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/host-groups/{id}",
+        "update_resource",
+        GroupWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/host-groups/{id}",
+        "delete_resource",
+        GroupWrite
+    ),
+    resource_route!("GET", "/api/v1/triggers/{id}", "get_resource", TriggerRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/triggers/{id}",
+        "update_resource",
+        TriggerWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/triggers/{id}",
+        "delete_resource",
+        TriggerWrite
+    ),
+    resource_route!("GET", "/api/v1/actions/{id}", "get_resource", ActionRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/actions/{id}",
+        "update_resource",
+        ActionWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/actions/{id}",
+        "delete_resource",
+        ActionWrite
+    ),
+    resource_route!("GET", "/api/v1/users/{id}", "get_resource", UserRead),
+    resource_route!("PUT", "/api/v1/users/{id}", "update_resource", AdminUsers),
+    resource_route!(
+        "DELETE",
+        "/api/v1/users/{id}",
+        "delete_resource",
+        AdminUsers
+    ),
+    resource_route!("GET", "/api/v1/api-tokens/{id}", "get_resource", UserRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/api-tokens/{id}",
+        "update_resource",
+        AdminUsers
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/api-tokens/{id}",
+        "delete_resource",
+        AdminUsers
+    ),
+    resource_route!("GET", "/api/v1/media-types/{id}", "get_resource", MediaRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/media-types/{id}",
+        "update_resource",
+        MediaWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/media-types/{id}",
+        "delete_resource",
+        MediaWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/dashboards/{id}",
+        "delete_resource",
+        DashboardWrite
+    ),
+    resource_route!(
+        "PUT",
+        "/api/v1/templates/{id}",
+        "update_resource",
+        TemplateWrite
+    ),
+    resource_route!(
+        "GET",
+        "/api/v1/templates/{id}",
+        "get_resource",
+        TemplateRead
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/templates/{id}",
+        "delete_resource",
+        TemplateWrite
+    ),
+    resource_route!("GET", "/api/v1/items/{id}", "get_resource", TemplateRead),
+    resource_route!(
+        "PUT",
+        "/api/v1/items/{id}",
+        "update_resource",
+        TemplateWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/items/{id}",
+        "delete_resource",
+        TemplateWrite
+    ),
+    resource_route!(
+        "GET",
+        "/api/v1/maintenances/{id}",
+        "get_resource",
+        MaintenanceRead
+    ),
+    resource_route!(
+        "PUT",
+        "/api/v1/maintenances/{id}",
+        "update_resource",
+        MaintenanceWrite
+    ),
+    resource_route!(
+        "DELETE",
+        "/api/v1/maintenances/{id}",
+        "delete_resource",
+        MaintenanceWrite
+    ),
+    RouteSpec {
+        method: "PUT",
+        path: "/api/v1/dashboards/{id}",
+        operation: "update_dashboard",
+        auth: AuthKind::User(Permission::DashboardWrite),
+        location: Location::Api,
+    },
     RouteSpec {
         method: "POST",
         path: "/api/v1/login",
@@ -395,9 +583,9 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
 
 #[derive(Clone, serde::Serialize)]
 pub(crate) struct ProblemNote {
-    tenant_id: Uuid,
-    problem_id: Uuid,
-    kind: String,
+    pub(crate) tenant_id: Uuid,
+    pub(crate) problem_id: Uuid,
+    pub(crate) kind: String,
 }
 
 #[derive(Clone)]
@@ -407,9 +595,23 @@ pub struct ApiState {
     pub(crate) events: broadcast::Sender<ProblemNote>,
     pub secure_cookie: bool,
     pub otlp_drop: Vec<String>,
+    pub(crate) db: Option<crate::db::Db>,
+    pub(crate) secrets: Option<Arc<crate::secrets::SecretBox>>,
+    pub(crate) quotas: Arc<crate::quota::Quotas>,
+    pub(crate) directory: Option<Arc<crate::store::Directory>>,
+    pub(crate) smtp: Option<crate::config::SmtpConfig>,
 }
 
 impl ApiState {
+    pub fn with_database(
+        mut self,
+        db: crate::db::Db,
+        secrets: Arc<crate::secrets::SecretBox>,
+    ) -> Self {
+        self.db = Some(db);
+        self.secrets = Some(secrets);
+        self
+    }
     pub fn new(catalog: Arc<MemoryCatalog>, store: Arc<dyn MetricStore>) -> Self {
         let (events, _) = broadcast::channel(64);
         Self {
@@ -418,6 +620,11 @@ impl ApiState {
             events,
             secure_cookie: false,
             otlp_drop: vec!["user_id".to_string()],
+            db: None,
+            secrets: None,
+            quotas: Arc::new(crate::quota::Quotas::per_second(50_000)),
+            directory: None,
+            smtp: None,
         }
     }
 }
@@ -440,7 +647,7 @@ pub fn router(state: ApiState) -> Router {
     for (path, methods) in groups {
         router = router.route(&axum_path(path), methods);
     }
-    let doc = ApiDoc::openapi();
+    let doc = serde_json::from_value(openapi_value()).expect("valid generated OpenAPI");
     router
         .merge(
             utoipa_swagger_ui::SwaggerUi::new("/api/v1/docs").url("/api/v1/docs/openapi.json", doc),
@@ -478,6 +685,17 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "login" => post(login),
         "logout" => post(logout),
         "openapi" => get(openapi),
+        "update_tenant" => axum::routing::put(update_tenant),
+        "link_parent" => post(link_parent),
+        "create_enrolment_token" => post(create_enrolment_token),
+        "list_discovery_rules" => get(list_discovery_rules),
+        "create_discovery_rule" => post(create_discovery_rule),
+        "get_snmp" => get(get_snmp),
+        "put_snmp" => axum::routing::put(put_snmp),
+        "create_tenant" => post(create_tenant),
+        "get_resource" => get(get_resource),
+        "update_resource" => axum::routing::put(update_resource),
+        "delete_resource" => axum::routing::delete(delete_resource),
         "list_hosts" => get(list_hosts),
         "create_host" => post(create_host),
         "get_host" => get(get_host),
@@ -501,6 +719,7 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "list_dashboards" => get(list_dashboards),
         "create_dashboard" => post(create_dashboard),
         "get_dashboard" => get(get_dashboard),
+        "update_dashboard" => axum::routing::put(update_dashboard),
         "list_templates" => get(list_templates),
         "create_template" => post(create_template),
         "export_template" => get(export_template),
@@ -529,20 +748,56 @@ pub fn openapi_value() -> Value {
         let entry = paths.entry(spec.path).or_insert_with(|| json!({}));
         let method = spec.method.to_ascii_lowercase();
         if let Some(object) = entry.as_object_mut() {
-            object.insert(
-                method,
-                json!({
-                    "operationId": spec.operation,
-                    "responses": { "200": { "description": "OK" } },
-                    "security": auth_security(spec.auth),
-                }),
-            );
+            let mut operation = json!({
+                "operationId": if matches!(spec.operation,"get_resource"|"update_resource"|"delete_resource") {format!("{}_{}",spec.operation,spec.path.split('/').nth(3).unwrap_or("resource").replace('-',"_"))} else {spec.operation.to_string()},
+                "responses": { "200": { "description": "OK", "content":{"application/json":{"schema":{"type":"object","additionalProperties":true}}}} },
+                "security": auth_security(spec.auth),
+            });
+            let mut parameters = Vec::new();
+            if spec.path.contains("{id}") {
+                parameters.push(json!({"name":"id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}));
+            }
+            if matches!(spec.operation, "query_instant" | "query_range") {
+                parameters.push(
+                    json!({"name":"query","in":"query","required":true,"schema":{"type":"string"}}),
+                );
+                for name in ["start", "end", "step", "time"] {
+                    parameters.push(json!({"name":name,"in":"query","required":spec.operation=="query_range" && matches!(name,"start"|"end"),"schema":{"type":"integer","format":"int64"}}));
+                }
+            } else if spec.operation.starts_with("list_") {
+                parameters.push(json!({"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200}}));
+                parameters.push(json!({"name":"cursor","in":"query","schema":{"type":"string","format":"uuid"}}));
+            }
+            for parameter in &mut parameters {
+                if parameter.get("required").is_none() {
+                    parameter["required"] = json!(false);
+                }
+            }
+            operation["parameters"] = json!(parameters);
+            if spec.method == "POST" || spec.method == "PUT" {
+                let schema = if spec.operation == "login" {
+                    json!({"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string","format":"password"}}})
+                } else {
+                    json!({"type":"object","additionalProperties":true})
+                };
+                operation["requestBody"] =
+                    json!({"required":true,"content":{"application/json":{"schema":schema}}});
+            }
+            if spec.operation == "login" {
+                operation["responses"]["200"]["content"]["application/json"]["schema"] = json!({"type":"object","required":["email"],"properties":{"email":{"type":"string"}}});
+            }
+            object.insert(method, operation);
         }
     }
     json!({
-        "openapi": "3.0.3",
+        "openapi": "3.1.0",
         "info": { "title": "Kestrel API", "version": env!("CARGO_PKG_VERSION") },
         "paths": paths,
+        "components":{"securitySchemes":{
+            "session":{"type":"apiKey","in":"cookie","name":"kestrel_session"},
+            "bearer":{"type":"http","scheme":"bearer"},
+            "mutualTls":{"type":"mutualTLS"}
+        }},
     })
 }
 
@@ -550,7 +805,7 @@ fn auth_security(auth: AuthKind) -> Value {
     match auth {
         AuthKind::Public => json!([]),
         AuthKind::Agent => json!([{"mutualTls": []}]),
-        AuthKind::User(_) => json!([{"session": []}]),
+        AuthKind::User(_) => json!([{"session": []},{"bearer": []}]),
     }
 }
 
@@ -568,7 +823,12 @@ impl IntoResponse for ApiError {
             "status": self.status.as_u16(),
             "detail": self.detail,
         });
-        (self.status, Json(body)).into_response()
+        (
+            self.status,
+            [(header::CONTENT_TYPE, "application/problem+json")],
+            Json(body),
+        )
+            .into_response()
     }
 }
 
@@ -591,6 +851,14 @@ impl FromRequestParts<ApiState> for AuthUser {
     ) -> Result<Self, Self::Rejection> {
         let session = session_secret(&parts.headers);
         let token = bearer_token(&parts.headers);
+        let session = if token.is_some() { None } else { session };
+        if state.db.is_some() {
+            return state
+                .pg_principal(session.as_deref(), token.as_deref())
+                .await?
+                .map(AuthUser)
+                .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "authentication required"));
+        }
         state
             .catalog
             .principal(session.as_deref(), token.as_deref())
@@ -648,10 +916,14 @@ async fn login(
             "email and password are required",
         ));
     }
-    let secret = state
-        .catalog
-        .login(&body.email, &body.password)
-        .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))?;
+    let secret = if state.db.is_some() {
+        state.pg_login(&body.email, &body.password).await?
+    } else {
+        state
+            .catalog
+            .login(&body.email, &body.password)
+            .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))?
+    };
     let cookie = session_cookie(&secret, state.secure_cookie);
     let mut response = Json(json!({ "email": body.email })).into_response();
     response.headers_mut().insert(
@@ -662,9 +934,17 @@ async fn login(
     Ok(response)
 }
 
-async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Result<Response, ApiError> {
+async fn logout(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
     if let Some(secret) = session_secret(&headers) {
-        state.catalog.logout(&secret);
+        if state.db.is_some() {
+            state.pg_logout(&principal, &secret).await?;
+        } else {
+            state.catalog.logout(&secret);
+        }
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().insert(
@@ -684,6 +964,205 @@ async fn list_hosts(
     page: Query<Page>,
 ) -> Result<Json<Value>, ApiError> {
     list_kind(state, user, Permission::HostRead, "host", page).await
+}
+
+fn uri_resource(
+    uri: &axum::http::Uri,
+    write: bool,
+) -> Result<(&'static str, Permission), ApiError> {
+    Ok(match (uri.path().split('/').nth(3).unwrap_or(""), write) {
+        ("hosts", false) => ("host", Permission::HostRead),
+        ("hosts", true) => ("host", Permission::HostWrite),
+        ("host-groups", false) => ("host_group", Permission::GroupRead),
+        ("host-groups", true) => ("host_group", Permission::GroupWrite),
+        ("triggers", false) => ("trigger", Permission::TriggerRead),
+        ("triggers", true) => ("trigger", Permission::TriggerWrite),
+        ("actions", false) => ("action", Permission::ActionRead),
+        ("actions", true) => ("action", Permission::ActionWrite),
+        ("users", false) => ("user", Permission::UserRead),
+        ("users", true) => ("user", Permission::AdminUsers),
+        ("api-tokens", false) => ("token", Permission::UserRead),
+        ("api-tokens", true) => ("token", Permission::AdminUsers),
+        ("media-types", false) => ("media", Permission::MediaRead),
+        ("media-types", true) => ("media", Permission::MediaWrite),
+        ("templates", false) => ("template", Permission::TemplateRead),
+        ("templates", true) => ("template", Permission::TemplateWrite),
+        ("items", false) => ("item", Permission::TemplateRead),
+        ("items", true) => ("item", Permission::TemplateWrite),
+        ("discovery-rules", false) => ("discovery_rule", Permission::TemplateRead),
+        ("discovery-rules", true) => ("discovery_rule", Permission::TemplateWrite),
+        ("maintenances", false) => ("maintenance", Permission::MaintenanceRead),
+        ("maintenances", true) => ("maintenance", Permission::MaintenanceWrite),
+        ("dashboards", false) => ("dashboard", Permission::DashboardRead),
+        ("dashboards", true) => ("dashboard", Permission::DashboardWrite),
+        _ => return Err(fail(StatusCode::NOT_FOUND, "not found")),
+    })
+}
+async fn create_enrolment_token(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::HostWrite)?;
+    let directory = state
+        .directory
+        .as_ref()
+        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "enrolment is unavailable"))?;
+    let group = body
+        .get("host_group_id")
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "invalid host_group_id"))
+        })
+        .transpose()?;
+    if let Some(group) = group {
+        if state.db.is_some() {
+            state.pg_get(&principal, "host_group", group, false).await?;
+        } else if state.catalog.get(&principal, "host_group", group).is_none() {
+            return Err(fail(StatusCode::NOT_FOUND, "host group not found"));
+        }
+    }
+    let ttl = body
+        .get("ttl_seconds")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| *value > 0 && *value <= 86400)
+                .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "ttl_seconds must be 1..86400"))
+        })
+        .transpose()?
+        .unwrap_or(3600);
+    let token = directory
+        .create_token_for(
+            principal.tenant_id,
+            group.map(|id| id.to_string()),
+            std::time::Duration::from_secs(ttl),
+        )
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "token creation failed"))?;
+    if state.db.is_some() {
+        state
+            .pg_record_control(&principal, "enrolment_token.create", "agent")
+            .await?;
+    }
+    Ok(Json(
+        json!({"token":token,"tenant_id":principal.tenant_id,"ttl_seconds":ttl}),
+    ))
+}
+async fn update_tenant(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    if state.db.is_some() {
+        return state.pg_update_tenant(&principal, id, body).await.map(Json);
+    }
+    Err(fail(StatusCode::NOT_FOUND, "not found"))
+}
+async fn link_parent(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::TemplateWrite)?;
+    let parent = body["parent_id"]
+        .as_str()
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "parent_id is required"))?;
+    if state.db.is_some() {
+        return state.pg_link_parent(&principal, id, parent).await.map(Json);
+    }
+    Err(fail(StatusCode::NOT_FOUND, "not found"))
+}
+async fn get_snmp(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::HostRead)?;
+    if state.db.is_some() {
+        return state.pg_snmp(&principal, id, None).await.map(Json);
+    }
+    Err(fail(StatusCode::NOT_FOUND, "not found"))
+}
+async fn put_snmp(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::HostWrite)?;
+    if state.db.is_some() {
+        return state.pg_snmp(&principal, id, Some(body)).await.map(Json);
+    }
+    Err(fail(StatusCode::NOT_FOUND, "not found"))
+}
+async fn get_resource(
+    State(state): State<ApiState>,
+    user: AuthUser,
+    Path(id): Path<Uuid>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Result<Json<Value>, ApiError> {
+    let (kind, permission) = uri_resource(&uri, false)?;
+    get_kind(State(state), user, permission, kind, id).await
+}
+async fn update_resource(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let (kind, permission) = uri_resource(&uri, true)?;
+    ensure(&principal, permission)?;
+    if state.db.is_some() {
+        return state.pg_update(&principal, kind, id, body).await.map(Json);
+    }
+    state
+        .catalog
+        .update(&principal, kind, id, body)
+        .map(Json)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not found"))
+}
+async fn delete_resource(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
+) -> Result<StatusCode, ApiError> {
+    let (kind, permission) = uri_resource(&uri, true)?;
+    ensure(&principal, permission)?;
+    if state.db.is_some() {
+        state.pg_delete(&principal, kind, id).await?;
+    } else if !state.catalog.delete(&principal, kind, id) {
+        return Err(fail(StatusCode::NOT_FOUND, "not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn create_tenant(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    if state.db.is_some() {
+        return state.pg_create_tenant(&principal, body).await.map(Json);
+    }
+    let name = body["name"]
+        .as_str()
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "name is required"))?;
+    let id = Uuid::new_v4();
+    state
+        .catalog
+        .add_tenant(id, name, Some(principal.tenant_id));
+    state.catalog.add_grant(principal.user_id, id);
+    Ok(Json(
+        json!({"id":id,"name":name,"parent_id":principal.tenant_id}),
+    ))
 }
 async fn create_host(
     state: State<ApiState>,
@@ -818,6 +1297,25 @@ async fn get_dashboard(
 ) -> Result<Json<Value>, ApiError> {
     get_kind(state, user, Permission::DashboardRead, "dashboard", id).await
 }
+async fn update_dashboard(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::DashboardWrite)?;
+    if state.db.is_some() {
+        return state
+            .pg_update_dashboard(&principal, id, body)
+            .await
+            .map(Json);
+    }
+    state
+        .catalog
+        .update_dashboard(&principal, id, body)
+        .map(Json)
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not found"))
+}
 async fn list_templates(
     state: State<ApiState>,
     user: AuthUser,
@@ -831,6 +1329,34 @@ async fn create_template(
     body: Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     create_kind(state, user, Permission::TemplateWrite, "template", body).await
+}
+async fn list_discovery_rules(
+    state: State<ApiState>,
+    user: AuthUser,
+    page: Query<Page>,
+) -> Result<Json<Value>, ApiError> {
+    list_kind(
+        state,
+        user,
+        Permission::TemplateRead,
+        "discovery_rule",
+        page,
+    )
+    .await
+}
+async fn create_discovery_rule(
+    state: State<ApiState>,
+    user: AuthUser,
+    body: Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    create_kind(
+        state,
+        user,
+        Permission::TemplateWrite,
+        "discovery_rule",
+        body,
+    )
+    .await
 }
 async fn list_items(
     state: State<ApiState>,
@@ -890,6 +1416,17 @@ async fn list_kind(
     Query(page): Query<Page>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, permission)?;
+    if state.db.is_some() {
+        return state
+            .pg_list(
+                &principal,
+                kind,
+                page.limit.unwrap_or(50),
+                page.cursor.as_deref(),
+            )
+            .await
+            .map(Json);
+    }
     Ok(Json(state.catalog.list_page(
         &principal,
         kind,
@@ -906,6 +1443,9 @@ async fn create_kind(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, permission)?;
+    if state.db.is_some() {
+        return state.pg_insert(&principal, kind, body).await.map(Json);
+    }
     state
         .catalog
         .insert(&principal, kind, body)
@@ -921,6 +1461,9 @@ async fn get_kind(
     id: Uuid,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, permission)?;
+    if state.db.is_some() {
+        return state.pg_get(&principal, kind, id, false).await.map(Json);
+    }
     state
         .catalog
         .get(&principal, kind, id)
@@ -936,10 +1479,14 @@ async fn ack_problem(
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::ProblemAck)?;
     let comment = body.comment.unwrap_or_default();
-    let updated = state
-        .catalog
-        .ack(&principal, id, &comment)
-        .map_err(|_| fail(StatusCode::NOT_FOUND, "not found"))?;
+    let updated = if state.db.is_some() {
+        state.pg_ack(&principal, id, &comment).await?
+    } else {
+        state
+            .catalog
+            .ack(&principal, id, &comment)
+            .map_err(|_| fail(StatusCode::NOT_FOUND, "not found"))?
+    };
     let _ = state.events.send(ProblemNote {
         tenant_id: principal.tenant_id,
         problem_id: id,
@@ -958,6 +1505,12 @@ async fn create_step(
     if let Some(object) = body.as_object_mut() {
         object.insert("action_id".to_string(), json!(id));
     }
+    if state.db.is_some() {
+        return state
+            .pg_insert(&principal, "action_step", body)
+            .await
+            .map(Json);
+    }
     state
         .catalog
         .insert(&principal, "action_step", body)
@@ -971,6 +1524,31 @@ async fn test_media(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::MediaWrite)?;
+    if state.db.is_some() {
+        let media = state.pg_get(&principal, "media", id, true).await?;
+        let mut target = media["config"].clone();
+        target["kind"] = media["kind"].clone();
+        target = crate::notify::with_smtp_defaults(target, state.smtp.as_ref());
+        let rendered = crate::notify::render_for_target(
+            "test", "test", "kestrel", "media", "1", "", "problem", &target,
+        )
+        .map_err(|_| {
+            fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "template rendering failed",
+            )
+        })?;
+        let result = if target["kind"] == "email" {
+            crate::notify::send_smtp(&rendered, &target).await
+        } else {
+            crate::notify::HttpNotifier::new()
+                .send(&rendered, &target)
+                .await
+        };
+        result.map_err(|_| fail(StatusCode::BAD_GATEWAY, "test delivery failed"))?;
+        state.pg_record_media_test(&principal, id).await?;
+        return Ok(Json(json!({"ok":true})));
+    }
     let media = state
         .catalog
         .get(&principal, "media", id)
@@ -1006,6 +1584,12 @@ async fn export_template(
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError> {
     ensure(&principal, Permission::TemplateRead)?;
+    if state.db.is_some() {
+        let doc = state.pg_export_template(&principal, id).await?;
+        let yaml = crate::config_compile::template_to_yaml(&doc)
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "template export failed"))?;
+        return Ok(([(header::CONTENT_TYPE, "application/yaml")], yaml).into_response());
+    }
     let template = state
         .catalog
         .get(&principal, "template", id)
@@ -1022,6 +1606,9 @@ async fn import_template(
     ensure(&principal, Permission::TemplateWrite)?;
     let doc = crate::config_compile::template_from_yaml(&body)
         .map_err(|err| fail(StatusCode::BAD_REQUEST, err))?;
+    if state.db.is_some() {
+        return state.pg_import_template(&principal, doc).await.map(Json);
+    }
     let template = state
         .catalog
         .insert(
@@ -1056,6 +1643,16 @@ async fn link_template(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::TemplateWrite)?;
+    if state.db.is_some() {
+        let template = body["template_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "template_id is required"))?;
+        return state
+            .pg_link_template(&principal, id, template)
+            .await
+            .map(Json);
+    }
     state
         .catalog
         .insert(
@@ -1072,6 +1669,9 @@ async fn list_audit(
     AuthUser(principal): AuthUser,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::AuditRead)?;
+    if state.db.is_some() {
+        return state.pg_audits(&principal).await.map(Json);
+    }
     Ok(Json(state.catalog.audits(&principal)))
 }
 
@@ -1112,7 +1712,11 @@ async fn scoped_query(
     step: u32,
     instant: bool,
 ) -> Result<Vec<Value>, ApiError> {
-    let hosts = state.catalog.host_names(principal);
+    let hosts = if state.db.is_some() {
+        state.pg_host_names(principal).await?
+    } else {
+        state.catalog.host_names(principal)
+    };
     let scoped = inject_scope(query, &principal.tenant_id.to_string(), hosts.as_deref())
         .map_err(|err| fail(StatusCode::BAD_REQUEST, err))?;
     let series = if instant {
@@ -1134,13 +1738,15 @@ async fn scoped_query(
         let tenant_ok = item
             .labels
             .iter()
-            .any(|(name, value)| name == "tenant" && value == &tenant);
+            .filter(|(name, _)| name == "tenant")
+            .all(|(_, value)| value == &tenant);
         let host_ok = match &hosts {
             None => true,
             Some(hosts) => item
                 .labels
                 .iter()
-                .any(|(name, value)| name == "host" && hosts.iter().any(|host| host == value)),
+                .filter(|(name, _)| name == "host")
+                .all(|(_, value)| hosts.iter().any(|host| host == value)),
         };
         if tenant_ok && host_ok {
             out.push(json!({ "labels": item.labels, "points": item.points }));
@@ -1149,16 +1755,67 @@ async fn scoped_query(
     Ok(out)
 }
 
+async fn event_permitted(
+    state: &ApiState,
+    session: Option<&str>,
+    bearer: Option<&str>,
+    note: &ProblemNote,
+) -> bool {
+    let principal = if state.db.is_some() {
+        match state.pg_principal(session, bearer).await {
+            Ok(Some(principal)) => principal,
+            _ => return false,
+        }
+    } else {
+        let Some(principal) = state.catalog.principal(session, bearer) else {
+            return false;
+        };
+        principal
+    };
+    if principal.tenant_id != note.tenant_id
+        || !role_allows(&principal.role, Permission::ProblemRead)
+    {
+        return false;
+    }
+    if state.db.is_some() {
+        state
+            .pg_get(&principal, "problem", note.problem_id, false)
+            .await
+            .is_ok()
+    } else {
+        state
+            .catalog
+            .get(&principal, "problem", note.problem_id)
+            .is_some()
+    }
+}
+
 async fn event_stream(
     State(state): State<ApiState>,
     AuthUser(principal): AuthUser,
+    headers: HeaderMap,
 ) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     ensure(&principal, Permission::ProblemRead)?;
-    let tenant = principal.tenant_id;
-    let stream = tokio_stream::wrappers::BroadcastStream::new(state.events.subscribe()).filter_map(
-        move |item| match item {
-            Ok(note) if note.tenant_id == tenant => Event::default().json_data(&note).ok().map(Ok),
-            _ => None,
+    let bearer = bearer_token(&headers);
+    let session = if bearer.is_some() {
+        None
+    } else {
+        session_secret(&headers)
+    };
+    let stream = futures::StreamExt::filter_map(
+        tokio_stream::wrappers::BroadcastStream::new(state.events.subscribe()),
+        move |item| {
+            let state = state.clone();
+            let session = session.clone();
+            let bearer = bearer.clone();
+            async move {
+                let note = item.ok()?;
+                if event_permitted(&state, session.as_deref(), bearer.as_deref(), &note).await {
+                    Event::default().json_data(&note).ok().map(Ok)
+                } else {
+                    None
+                }
+            }
         },
     );
     Ok(Sse::new(stream))
@@ -1173,6 +1830,10 @@ async fn switch_tenant(
     ensure(&principal, Permission::TenantRead)?;
     let secret = session_secret(&headers)
         .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "authentication required"))?;
+    if state.db.is_some() {
+        state.pg_switch(&principal, &secret, body.tenant_id).await?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
     state
         .catalog
         .switch_tenant(&secret, body.tenant_id)
@@ -1185,6 +1846,9 @@ async fn msp_overview(
     AuthUser(principal): AuthUser,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::MspRead)?;
+    if state.db.is_some() {
+        return state.pg_overview(&principal).await.map(Json);
+    }
     Ok(Json(state.catalog.msp_overview(&principal)))
 }
 
@@ -1204,6 +1868,17 @@ async fn create_grant(
         .and_then(Value::as_str)
         .and_then(|value| Uuid::parse_str(value).ok())
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "tenant_id is required"))?;
+    if state.db.is_some() {
+        return state
+            .pg_grant(
+                &principal,
+                user_id,
+                tenant_id,
+                body["role"].as_str().unwrap_or("viewer"),
+            )
+            .await
+            .map(Json);
+    }
     state.catalog.add_grant(user_id, tenant_id);
     state
         .catalog
@@ -1237,6 +1912,11 @@ async fn otlp_metrics(
         samples_from_json(text, &drop_names).map_err(|err| fail(StatusCode::BAD_REQUEST, err))?
     };
     let mut labelled = Vec::new();
+    let allowed_hosts = if state.db.is_some() {
+        state.pg_host_names(&principal).await?
+    } else {
+        state.catalog.host_names(&principal)
+    };
     for sample in samples {
         let mut labels: Vec<(String, String)> = sample
             .labels
@@ -1244,6 +1924,14 @@ async fn otlp_metrics(
             .filter(|(name, _)| name != "tenant")
             .collect();
         labels.push(("tenant".to_string(), principal.tenant_id.to_string()));
+        if let Some(hosts) = &allowed_hosts {
+            if !labels
+                .iter()
+                .any(|(name, value)| name == "host" && hosts.contains(value))
+            {
+                return Err(fail(StatusCode::FORBIDDEN, "host is outside your scope"));
+            }
+        }
         labelled.push(LabelledSample {
             name: sample.name,
             labels,
@@ -1252,6 +1940,28 @@ async fn otlp_metrics(
         });
     }
     let count = labelled.len();
+    let rate = if let Some(db) = &state.db {
+        sqlx::query_scalar::<_, i32>("SELECT samples_per_second FROM tenants WHERE id=$1")
+            .bind(principal.tenant_id)
+            .fetch_one(&db.pool)
+            .await
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "quota lookup failed"))?
+            .max(0) as u32
+    } else {
+        50_000
+    };
+    if count > 0
+        && state
+            .quotas
+            .check_with_rate(
+                principal.tenant_id,
+                u32::try_from(count).unwrap_or(u32::MAX),
+                rate,
+            )
+            .is_err()
+    {
+        return Err(fail(StatusCode::TOO_MANY_REQUESTS, "sample quota exceeded"));
+    }
     state
         .store
         .write(labelled)

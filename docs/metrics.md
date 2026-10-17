@@ -1,5 +1,7 @@
 # Metrics
 
+`kestrel_filesystem_used_ratio{mount,device,fstype}` is the fraction of filesystem space unavailable to the agent, between zero and one.
+
 Built-in collectors in `kestrel-checks` emit Prometheus-style series. A name
 ending in `_total` is a counter: it only goes up, and the server computes the
 rate. Everything else is a gauge. Sample timestamps are the `now_ms` value

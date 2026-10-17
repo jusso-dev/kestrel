@@ -18,7 +18,7 @@ pub struct OtlpSample {
 
 pub fn samples_from_protobuf(bytes: &[u8], drop: &[&str]) -> Result<Vec<OtlpSample>, String> {
     let request = ExportMetricsServiceRequest::decode(bytes).map_err(|err| err.to_string())?;
-    Ok(samples_from_request(&request, drop))
+    Ok(normalise_samples(samples_from_request(&request, drop)))
 }
 
 pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, String> {
@@ -56,13 +56,14 @@ pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, S
                     {
                         let mut point_labels = labels.clone();
                         point_labels.extend(attributes_json(Some(point), drop));
-                        if point_labels.len() > MAX_LABELS {
+                        point_labels = merge_labels(point_labels);
+                        if point_labels.len() > MAX_LABELS - 1 {
                             continue;
                         }
                         let value = point
                             .get("asDouble")
-                            .and_then(Json::as_f64)
-                            .or_else(|| point.get("asInt").and_then(Json::as_f64))
+                            .and_then(number)
+                            .or_else(|| point.get("asInt").and_then(number))
                             .unwrap_or(0.0);
                         samples.push(OtlpSample {
                             name: name.to_string(),
@@ -81,11 +82,12 @@ pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, S
                     {
                         let mut point_labels = labels.clone();
                         point_labels.extend(attributes_json(Some(point), drop));
-                        if point_labels.len() > MAX_LABELS {
+                        point_labels = merge_labels(point_labels);
+                        if point_labels.len() > MAX_LABELS - 2 {
                             continue;
                         }
                         let ts = unix_nano_ms(point.get("timeUnixNano"));
-                        if let Some(sum) = point.get("sum").and_then(Json::as_f64) {
+                        if let Some(sum) = point.get("sum").and_then(number) {
                             samples.push(OtlpSample {
                                 name: format!("{name}_sum"),
                                 labels: point_labels.clone(),
@@ -93,7 +95,7 @@ pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, S
                                 timestamp_ms: ts,
                             });
                         }
-                        if let Some(count) = point.get("count").and_then(Json::as_f64) {
+                        if let Some(count) = point.get("count").and_then(number) {
                             samples.push(OtlpSample {
                                 name: format!("{name}_count"),
                                 labels: point_labels.clone(),
@@ -113,7 +115,7 @@ pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, S
                             .unwrap_or_default();
                         let mut cumulative = 0.0;
                         for (index, bound) in bounds.iter().enumerate() {
-                            cumulative += counts.get(index).and_then(Json::as_f64).unwrap_or(0.0);
+                            cumulative += counts.get(index).and_then(number).unwrap_or(0.0);
                             let mut bucket_labels = point_labels.clone();
                             bucket_labels.push(("le".to_string(), json_number(bound)));
                             samples.push(OtlpSample {
@@ -123,13 +125,24 @@ pub fn samples_from_json(body: &str, drop: &[&str]) -> Result<Vec<OtlpSample>, S
                                 timestamp_ms: ts,
                             });
                         }
+                        let mut bucket_labels = point_labels.clone();
+                        bucket_labels.push(("le".to_string(), "+Inf".to_string()));
+                        samples.push(OtlpSample {
+                            name: format!("{name}_bucket"),
+                            labels: bucket_labels,
+                            value: point
+                                .get("count")
+                                .and_then(number)
+                                .unwrap_or_else(|| counts.iter().filter_map(number).sum()),
+                            timestamp_ms: ts,
+                        });
                     }
                 }
             }
         }
         let _ = &mut labels;
     }
-    Ok(samples)
+    Ok(normalise_samples(samples))
 }
 
 fn samples_from_request(request: &ExportMetricsServiceRequest, drop: &[&str]) -> Vec<OtlpSample> {
@@ -165,7 +178,8 @@ fn samples_from_request(request: &ExportMetricsServiceRequest, drop: &[&str]) ->
                         for point in &histogram.data_points {
                             let mut labels = resource_labels.clone();
                             labels.extend(attributes(&point.attributes, drop));
-                            if labels.len() > MAX_LABELS {
+                            labels = merge_labels(labels);
+                            if labels.len() > MAX_LABELS - 2 {
                                 continue;
                             }
                             let ts = (point.time_unix_nano / 1_000_000) as i64;
@@ -185,7 +199,9 @@ fn samples_from_request(request: &ExportMetricsServiceRequest, drop: &[&str]) ->
                             });
                             let mut cumulative = 0u64;
                             for (index, bound) in point.explicit_bounds.iter().enumerate() {
-                                cumulative += point.bucket_counts.get(index).copied().unwrap_or(0);
+                                cumulative = cumulative.saturating_add(
+                                    point.bucket_counts.get(index).copied().unwrap_or(0),
+                                );
                                 let mut bucket = labels.clone();
                                 bucket.push(("le".to_string(), bound.to_string()));
                                 samples.push(OtlpSample {
@@ -195,6 +211,14 @@ fn samples_from_request(request: &ExportMetricsServiceRequest, drop: &[&str]) ->
                                     timestamp_ms: ts,
                                 });
                             }
+                            let mut bucket = labels.clone();
+                            bucket.push(("le".to_string(), "+Inf".to_string()));
+                            samples.push(OtlpSample {
+                                name: format!("{}_bucket", metric.name),
+                                labels: bucket,
+                                value: point.count as f64,
+                                timestamp_ms: ts,
+                            });
                         }
                     }
                     None => {}
@@ -215,7 +239,8 @@ fn push_numbers(
     for point in points {
         let mut labels = resource_labels.to_vec();
         labels.extend(attributes(&point.attributes, drop));
-        if labels.len() > MAX_LABELS {
+        labels = merge_labels(labels);
+        if labels.len() > MAX_LABELS - 1 {
             continue;
         }
         let value = match point.value {
@@ -291,6 +316,16 @@ fn attributes_json(value: Option<&Json>, drop: &[&str]) -> Vec<(String, String)>
                 item.pointer("/value/doubleValue")
                     .and_then(Json::as_f64)
                     .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                item.pointer("/value/intValue")
+                    .and_then(number)
+                    .map(|value| value.to_string())
+            })
+            .or_else(|| {
+                item.pointer("/value/boolValue")
+                    .and_then(Json::as_bool)
+                    .map(|value| value.to_string())
             });
         let Some(raw) = raw else {
             continue;
@@ -319,9 +354,101 @@ fn json_number(value: &Json) -> String {
         .unwrap_or_else(|| "0".to_string())
 }
 
+fn normalise_samples(samples: Vec<OtlpSample>) -> Vec<OtlpSample> {
+    samples
+        .into_iter()
+        .filter_map(|mut sample| {
+            sample.name = sample
+                .name
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':') {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            if sample.name.is_empty() {
+                return None;
+            }
+            if sample.name.starts_with(|ch: char| ch.is_ascii_digit()) {
+                sample.name.insert(0, '_');
+            }
+            sample.labels = merge_labels(sample.labels);
+            if sample.labels.len() >= MAX_LABELS {
+                return None;
+            }
+            Some(sample)
+        })
+        .collect()
+}
+
+fn number(value: &Json) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+}
+
+fn merge_labels(labels: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut unique = std::collections::BTreeMap::new();
+    for (name, value) in labels {
+        let name = name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        if name.is_empty()
+            || name.starts_with(|ch: char| ch.is_ascii_digit())
+            || matches!(name.as_str(), "tenant" | "__name__")
+        {
+            continue;
+        }
+        unique.insert(name, value);
+    }
+    unique.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn otlp_json_string_numbers_histogram_infinity_and_attribute_overrides() {
+        let body=serde_json::json!({"resourceMetrics":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"old"}},{"key":"http.route","value":{"stringValue":"/checkout"}}]},"scopeMetrics":[{"metrics":[{"name":"duration","histogram":{"dataPoints":[{"count":"3","sum":4.5,"bucketCounts":["1","1","1"],"explicitBounds":[1.0,2.0],"timeUnixNano":"1700000000000000000","attributes":[{"key":"service.name","value":{"stringValue":"new"}}]}]}},{"name":"requests","sum":{"dataPoints":[{"asInt":"17","timeUnixNano":"1700000000000000000"}]}}]}]}]}).to_string();
+        let samples = samples_from_json(&body, &[]).unwrap();
+        assert!(samples
+            .iter()
+            .any(|sample| sample.name == "requests" && sample.value == 17.0));
+        let bucket = samples
+            .iter()
+            .find(|sample| {
+                sample
+                    .labels
+                    .iter()
+                    .any(|(name, value)| name == "le" && value == "+Inf")
+            })
+            .unwrap();
+        assert_eq!(bucket.value, 3.0);
+        assert_eq!(
+            bucket
+                .labels
+                .iter()
+                .filter(|(name, _)| name == "job")
+                .count(),
+            1
+        );
+        assert!(bucket
+            .labels
+            .iter()
+            .any(|(name, value)| name == "job" && value == "new"));
+        assert!(bucket.labels.iter().any(|(name, _)| name == "http_route"));
+    }
 
     #[test]
     fn otlp_json_maps_service_name_and_enforces_cardinality() {

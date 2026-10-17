@@ -1,17 +1,19 @@
 //! Kestrel agent library. The binary in `main.rs` calls [`run`].
 
+pub mod bootstrap;
 pub mod buffer;
 pub mod config;
 pub mod desired;
 pub mod identity;
+pub mod inventory;
 mod perms;
+mod runtime;
 pub mod scheduler;
 pub mod service;
 pub mod shipper;
 
 use buffer::Buffer;
-use kestrel_checks::builtin_collectors;
-use scheduler::{run_batcher, spawn_collectors};
+use scheduler::run_batcher;
 use shipper::{sample_jitter, Shipper};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -23,6 +25,10 @@ use tokio::sync::{mpsc, watch};
 /// Samples are written to a size-capped segment log under the data directory
 /// and posted to the configured server in order.
 pub fn run() -> Result<(), AgentError> {
+    run_with_shutdown(None)
+}
+
+pub(crate) fn run_with_shutdown(stop: Option<watch::Receiver<bool>>) -> Result<(), AgentError> {
     config::init_tracing();
     let path = config::config_path_from_args(std::env::args().skip(1));
     let cfg = config::load_agent_config(&path)?;
@@ -38,12 +44,18 @@ pub fn run() -> Result<(), AgentError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(serve(cfg))
+    runtime.block_on(serve(cfg, stop))
 }
 
-async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
+async fn serve(
+    cfg: config::AgentConfigFile,
+    mut stop: Option<watch::Receiver<bool>>,
+) -> Result<(), AgentError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let identity = identity::ensure(&cfg).await?;
+    let identity = tokio::select! {
+        identity = identity::ensure(&cfg) => identity?,
+        _ = requested_stop(&mut stop) => return Ok(()),
+    };
     let agent_id = if let Some(id) = &identity {
         id.agent_id.clone()
     } else {
@@ -55,9 +67,15 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
         max_bytes,
     )?));
     let (sample_tx, sample_rx) = mpsc::channel(256);
+    let (collect_tx, collect_rx) = mpsc::channel(256);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    spawn_collectors(builtin_collectors(), sample_tx, shutdown_rx.clone());
+    let latest = Arc::new(Mutex::new(std::collections::BTreeMap::new()));
+    let forwarder = tokio::spawn(runtime::forward_samples(
+        collect_rx,
+        sample_tx,
+        latest.clone(),
+    ));
 
     let batch_buffer = Arc::clone(&buffer);
     let batch_id = agent_id.clone();
@@ -73,6 +91,27 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
         None => Shipper::new(&cfg.server_url)?,
     };
     let shipper = Arc::new(shipper);
+    let config_task = tokio::spawn(runtime::poll_config(
+        cfg.clone(),
+        shipper.clone(),
+        collect_tx,
+        buffer.clone(),
+        agent_id.clone(),
+        shutdown_rx.clone(),
+    ));
+    let inventory_task = tokio::spawn(inventory::run(
+        buffer.clone(),
+        agent_id,
+        shutdown_rx.clone(),
+    ));
+    let metrics_task = cfg.prometheus_listen.clone().map(|addr| {
+        let stop = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = runtime::serve_metrics(&addr, latest, stop).await {
+                tracing::error!(error=%err,"Prometheus listener failed");
+            }
+        })
+    });
     let shipper_task_client = Arc::clone(&shipper);
     let shipper_task = tokio::spawn(async move {
         shipper_task_client
@@ -133,8 +172,17 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
         }
     });
 
-    tokio::signal::ctrl_c().await?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = requested_stop(&mut stop) => {},
+    }
     let _ = shutdown_tx.send(true);
+    let _ = config_task.await;
+    let _ = inventory_task.await;
+    let _ = forwarder.await;
+    if let Some(task) = metrics_task {
+        let _ = task.await;
+    }
     let _ = batcher.await;
     let _ = shipper_task.await;
     if let Some(task) = renew_task {
@@ -144,6 +192,16 @@ async fn serve(cfg: config::AgentConfigFile) -> Result<(), AgentError> {
     let mut guard = buffer.lock().unwrap_or_else(|err| err.into_inner());
     guard.sync()?;
     Ok(())
+}
+
+async fn requested_stop(stop: &mut Option<watch::Receiver<bool>>) {
+    if let Some(stop) = stop {
+        if !*stop.borrow() {
+            let _ = stop.changed().await;
+        }
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 fn load_or_create_agent_id(data_dir: &Path) -> Result<String, AgentError> {

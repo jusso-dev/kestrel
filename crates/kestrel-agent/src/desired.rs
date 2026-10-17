@@ -61,6 +61,7 @@ mod tests {
             server_url: url::Url::parse("https://kestrel.example/").unwrap(),
             data_dir: std::path::PathBuf::from("/var/lib/kestrel"),
             enrol_token: None,
+            bootstrap_ca_path: None,
             interval_s: 30,
             buffer_max_mb: 16,
             labels: BTreeMap::new(),
@@ -83,6 +84,7 @@ mod tests {
             }],
             logs: vec![],
             etag: "\"abc\"".to_string(),
+            items: vec![],
         };
         assert!(checks_from_config(&cfg(false), &spec).is_empty());
         assert!(checks_from_config(&cfg(true), &spec).is_empty());

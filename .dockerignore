@@ -1,0 +1,14 @@
+.git
+target
+web/node_modules
+web/.svelte-kit
+web/build
+deploy/dev/data
+deploy/dev/certs
+data
+*.key
+*.pem
+.env*
+agent-local.toml
+kestrel-enrol-token
+kestrel-dev-ca.crt

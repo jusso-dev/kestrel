@@ -13,6 +13,7 @@ pub const LOAD5: &str = "kestrel_load5";
 pub const LOAD15: &str = "kestrel_load15";
 pub const FILESYSTEM_FREE_BYTES: &str = "kestrel_filesystem_free_bytes";
 pub const FILESYSTEM_SIZE_BYTES: &str = "kestrel_filesystem_size_bytes";
+pub const FILESYSTEM_USED_RATIO: &str = "kestrel_filesystem_used_ratio";
 pub const DISK_READ_BYTES_TOTAL: &str = "kestrel_disk_read_bytes_total";
 pub const DISK_WRITTEN_BYTES_TOTAL: &str = "kestrel_disk_written_bytes_total";
 pub const NETWORK_RECEIVE_BYTES_TOTAL: &str = "kestrel_network_receive_bytes_total";
@@ -43,6 +44,7 @@ pub const DOCUMENTED: &[&str] = &[
     LOAD15,
     FILESYSTEM_FREE_BYTES,
     FILESYSTEM_SIZE_BYTES,
+    FILESYSTEM_USED_RATIO,
     DISK_READ_BYTES_TOTAL,
     DISK_WRITTEN_BYTES_TOTAL,
     NETWORK_RECEIVE_BYTES_TOTAL,

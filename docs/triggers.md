@@ -8,8 +8,8 @@ The tenant label is added by the server. Do not put a tenant matcher in a trigge
 
 1. Disk above 90 percent: `kestrel_filesystem_used_ratio > 0.9`
 2. Agent silent for three minutes: `time() - kestrel_agent_last_seen_timestamp > 180`
-3. Load above 8: `kestrel_cpu_load1 > 8`
-4. Memory above 90 percent: `kestrel_memory_used_ratio > 0.9`
+3. Load above 8 (Unix hosts): `kestrel_load1 > 8`
+4. Memory above 90 percent: `kestrel_memory_used_bytes / kestrel_memory_total_bytes > 0.9`
 5. HTTP check down: `kestrel_http_up == 0`
 6. Slow HTTP check: `kestrel_http_duration_seconds > 2`
 7. Certificate expiry inside 14 days: `kestrel_tls_cert_expiry_timestamp_seconds - time() < 14 * 24 * 3600`

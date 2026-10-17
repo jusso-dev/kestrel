@@ -14,3 +14,8 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/jusso-dev/kestrel"
 rust-version = "1.80"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

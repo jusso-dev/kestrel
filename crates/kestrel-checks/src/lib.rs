@@ -37,8 +37,8 @@ pub use network::NetworkCollector;
 pub use perfdata::{parse_perfdata, PerfPoint};
 pub use process::{ProcessCollector, TOP_PROCESSES};
 pub use prom_scrape::{
-    encode_exposition, parse_exposition, relabel, to_agent_samples, validate_exposition,
-    ExpositionSample,
+    encode_exposition, parse_exposition, relabel, scrape_prometheus, to_agent_samples,
+    validate_exposition, ExpositionSample,
 };
 pub use selfstats::SelfStatsCollector;
 pub use service::ServiceCollector;

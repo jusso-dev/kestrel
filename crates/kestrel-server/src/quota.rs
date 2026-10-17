@@ -10,8 +10,11 @@ use uuid::Uuid;
 #[derive(Debug)]
 pub struct OverQuota;
 
+type TenantLimiter = RateLimiter<Uuid, DefaultKeyedStateStore<Uuid>, DefaultClock>;
+
 pub struct Quotas {
-    limiter: RateLimiter<Uuid, DefaultKeyedStateStore<Uuid>, DefaultClock>,
+    limiter: TenantLimiter,
+    configured: std::sync::Mutex<std::collections::HashMap<u32, TenantLimiter>>,
 }
 
 impl Quotas {
@@ -19,12 +22,29 @@ impl Quotas {
         let rate = NonZeroU32::new(rate.max(1)).unwrap_or(NonZeroU32::MIN);
         Self {
             limiter: RateLimiter::keyed(Quota::per_second(rate)),
+            configured: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub fn check(&self, tenant: Uuid, samples: u32) -> Result<(), OverQuota> {
         let samples = NonZeroU32::new(samples).ok_or(OverQuota)?;
         match self.limiter.check_key_n(&tenant, samples) {
+            Ok(Ok(_)) => Ok(()),
+            _ => Err(OverQuota),
+        }
+    }
+
+    pub fn check_with_rate(&self, tenant: Uuid, samples: u32, rate: u32) -> Result<(), OverQuota> {
+        let samples = NonZeroU32::new(samples).ok_or(OverQuota)?;
+        let rate = NonZeroU32::new(rate).ok_or(OverQuota)?;
+        let mut rates = self
+            .configured
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let limiter = rates
+            .entry(rate.get())
+            .or_insert_with(|| RateLimiter::keyed(Quota::per_second(rate)));
+        match limiter.check_key_n(&tenant, samples) {
             Ok(Ok(_)) => Ok(()),
             _ => Err(OverQuota),
         }

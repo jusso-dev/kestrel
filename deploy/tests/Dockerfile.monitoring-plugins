@@ -1,0 +1,15 @@
+# Isolated acceptance fixture. The distribution plugins are never modified.
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=kestrel-server-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=kestrel-server-target,target=/src/target \
+    cargo build --locked --release -j 2 -p kestrel-checks --example monitoring_plugins && \
+    cp target/release/examples/monitoring_plugins /monitoring-plugins-probe
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends monitoring-plugins-basic && rm -rf /var/lib/apt/lists/*
+COPY --from=build /monitoring-plugins-probe /monitoring-plugins-probe
+USER nobody:nogroup
+ENTRYPOINT ["/monitoring-plugins-probe"]

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Kestrel Agent" Language="1033" Version="$(var.Version)" Manufacturer="Kestrel" UpgradeCode="3B9C4D63-AF90-4F45-B5BD-A0D6CA022E06">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder"><Directory Id="INSTALLFOLDER" Name="Kestrel">
+        <Component Id="Agent" Guid="F5086475-BFD1-4D27-974A-E87BDAF7B09B" Win64="yes">
+          <File Id="AgentExe" Source="$(var.CargoTargetBinDir)\kestrel-agent.exe" KeyPath="yes" />
+          <ServiceInstall Id="AgentService" Name="kestrel-agent" DisplayName="Kestrel monitoring agent" Type="ownProcess" Start="demand" ErrorControl="normal" Arguments="--service" Account="LocalSystem" />
+          <ServiceControl Id="ControlAgent" Name="kestrel-agent" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+      </Directory></Directory>
+    </Directory>
+    <Feature Id="AgentFeature" Title="Kestrel Agent" Level="1"><ComponentRef Id="Agent" /></Feature>
+  </Product>
+</Wix>

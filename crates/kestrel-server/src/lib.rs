@@ -21,7 +21,9 @@ pub mod poller;
 pub mod promql;
 pub mod quota;
 pub mod rules;
+mod runtime;
 pub mod secrets;
+mod security;
 mod store;
 mod tls;
 pub mod web;
@@ -40,8 +42,8 @@ pub fn run() -> Result<(), ServerError> {
         path = %path.display(),
         listen = %cfg.listen,
         ingest = ?cfg.ingest_listen,
-        victoria = %cfg.victoria_url,
-        public = %cfg.public_url,
+        victoria = %cfg.victoria_url.origin().ascii_serialization(),
+        public = %cfg.public_url.origin().ascii_serialization(),
         smtp = cfg.smtp.is_some(),
         "configuration loaded"
     );

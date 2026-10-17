@@ -53,11 +53,23 @@ fn parse_token(token: &str) -> Option<PerfPoint> {
 fn split_label(token: &str) -> Option<(String, &str)> {
     let token = token.trim();
     if let Some(rest) = token.strip_prefix('\'') {
-        let end = rest.find('\'')?;
-        let label = rest[..end].to_string();
-        let after = rest[end + 1..].trim_start();
-        let rest = after.strip_prefix('=')?.trim();
-        return Some((label, rest));
+        let mut label = String::new();
+        let mut chars = rest.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\'' {
+                if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                    chars.next();
+                    label.push('\'');
+                    continue;
+                }
+                return Some((
+                    label,
+                    rest[index + 1..].trim_start().strip_prefix('=')?.trim(),
+                ));
+            }
+            label.push(ch);
+        }
+        return None;
     }
     if let Some(rest) = token.strip_prefix('"') {
         let end = rest.find('"')?;
@@ -191,5 +203,17 @@ mod tests {
         let points = parse_perfdata("not-a-point used=1;2;3;0;10").unwrap();
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].label, "used");
+    }
+
+    #[test]
+    fn perfdata_supports_escaped_labels_ranges_and_unknown_values() {
+        let points =
+            parse_perfdata("'user''s disk'=12.5GB;@10:20;~:30;0;100 unknown=U okay=-1.2e3ms")
+                .unwrap();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].label, "user's disk");
+        assert_eq!(points[0].value, 12.5);
+        assert_eq!(points[0].uom, "GB");
+        assert_eq!(points[1].value, -1200.0);
     }
 }

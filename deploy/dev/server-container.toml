@@ -1,0 +1,16 @@
+listen = "0.0.0.0:8443"
+database_url = "postgres://kestrel:kestrel@postgres:5432/kestrel"
+victoria_url = "http://victoria:8428"
+public_url = "https://localhost:8443"
+data_dir = "/var/lib/kestrel"
+[tls]
+cert_path = "/var/lib/kestrel/server.crt"
+key_path = "/var/lib/kestrel/server.key"
+[ca]
+cert_path = "/var/lib/kestrel/ca.crt"
+key_path = "/var/lib/kestrel/ca.key"
+[smtp]
+host = "mailpit"
+port = 1025
+from = "kestrel@localhost"
+starttls = false

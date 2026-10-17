@@ -308,7 +308,6 @@ impl MemoryCatalog {
         if let Some(object) = body.as_object_mut() {
             object.insert("id".to_string(), json!(id));
             object.insert("tenant_id".to_string(), json!(principal.tenant_id));
-            object.insert("kind".to_string(), json!(kind));
         }
         self.lock().rows.push(Row {
             id,
@@ -359,6 +358,62 @@ impl MemoryCatalog {
         drop(inner);
         self.audit(principal, "problem.ack", &id.to_string());
         Ok(body)
+    }
+
+    pub fn update_dashboard(&self, principal: &Principal, id: Uuid, body: Value) -> Option<Value> {
+        self.get(principal, "dashboard", id)?;
+        let mut inner = self.lock();
+        let row = inner.rows.iter_mut().find(|row| {
+            row.kind == "dashboard" && row.id == id && row.tenant_id == principal.tenant_id
+        })?;
+        let object = body.as_object()?;
+        for key in ["name", "layout"] {
+            if let Some(value) = object.get(key) {
+                row.body[key] = value.clone();
+            }
+        }
+        let result = row.body.clone();
+        drop(inner);
+        self.audit(principal, "dashboard.update", &id.to_string());
+        Some(result)
+    }
+
+    pub fn update(
+        &self,
+        principal: &Principal,
+        kind: &str,
+        id: Uuid,
+        body: Value,
+    ) -> Option<Value> {
+        self.get(principal, kind, id)?;
+        let mut inner = self.lock();
+        let row = inner
+            .rows
+            .iter_mut()
+            .find(|row| row.kind == kind && row.id == id && row.tenant_id == principal.tenant_id)?;
+        for (key, value) in body.as_object()? {
+            if !matches!(
+                key.as_str(),
+                "id" | "tenant_id" | "password" | "password_hash" | "token_hash"
+            ) {
+                row.body[key] = value.clone();
+            }
+        }
+        let result = public_body(&row.body);
+        drop(inner);
+        self.audit(principal, &format!("{kind}.update"), &id.to_string());
+        Some(result)
+    }
+
+    pub fn delete(&self, principal: &Principal, kind: &str, id: Uuid) -> bool {
+        if self.get(principal, kind, id).is_none() {
+            return false;
+        }
+        self.lock().rows.retain(|row| {
+            !(row.kind == kind && row.id == id && row.tenant_id == principal.tenant_id)
+        });
+        self.audit(principal, &format!("{kind}.delete"), &id.to_string());
+        true
     }
 
     pub fn audits(&self, principal: &Principal) -> Value {

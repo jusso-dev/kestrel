@@ -71,7 +71,13 @@ impl MetricStore for VictoriaStore {
         let response = self
             .client
             .get(url)
-            .query(&[("query", promql), ("time", &at.to_string())])
+            // VictoriaMetrics otherwise shifts recent instant-query timestamps
+            // backwards by search.latencyOffset (30 seconds by default).
+            .query(&[
+                ("query", promql),
+                ("time", &at.to_string()),
+                ("nocache", "1"),
+            ])
             .send()
             .await
             .map_err(|err| crate::ServerError::new(format!("victoria query: {err}")))?;
@@ -264,6 +270,8 @@ mod tests {
             .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/query"))
+            .and(wiremock::matchers::query_param("nocache", "1"))
+            .and(wiremock::matchers::query_param("time", "1700000000"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
                 r#"{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"kestrel_memory_used_bytes","tenant":"default","host":"web-1"},"value":[1700000000,"1024"]}]}}"#,
             ))

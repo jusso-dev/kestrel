@@ -1,7 +1,7 @@
 //! One-time enrolment and certificate renewal.
 //!
-//! The enrol request is the bootstrap: the token is the secret, and the CA
-//! returned by the server pins every later connection. Renewal runs once
+//! Enrollment verifies the server using public roots or an out-of-band CA
+//! before presenting the token. The returned CA pins later connections. Renewal runs once
 //! two thirds of the certificate lifetime has elapsed.
 
 use crate::config::AgentConfigFile;
@@ -40,6 +40,8 @@ impl Identity {
 ///
 /// An existing certificate is renewed when [`needs_renew`] is true.
 pub async fn ensure(cfg: &AgentConfigFile) -> Result<Option<Identity>, IdentityError> {
+    crate::config::validate_server_url(&cfg.server_url)
+        .map_err(|err| IdentityError::new(err.to_string()))?;
     if let Some(existing) = load(&cfg.data_dir)? {
         return Ok(Some(
             renew_if_due(&cfg.server_url, &cfg.data_dir, existing).await?,
@@ -150,7 +152,7 @@ async fn enrol_new(cfg: &AgentConfigFile) -> Result<Identity, IdentityError> {
     }
     let (key_pem, csr_pem) = new_csr()?;
     tracing::info!(server = %cfg.server_url, "enrolling agent");
-    let client = bootstrap_client()?;
+    let client = bootstrap_client(cfg.bootstrap_ca_path.as_deref())?;
     let url = service_url(&cfg.server_url, "api/v1/enrol")?;
     let response = client
         .post(url)
@@ -318,17 +320,34 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
-fn bootstrap_client() -> Result<reqwest::Client, IdentityError> {
-    // The token authenticates this first request. The CA arrives in the response.
-    reqwest::Client::builder()
+fn bootstrap_client(ca_path: Option<&Path>) -> Result<reqwest::Client, IdentityError> {
+    // Authenticate the server before sending a bearer enrollment token.
+    // Private PKI trust must be distributed out of band, never learned from
+    // an unauthenticated enrollment response.
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = ca_path {
+        let pem = std::fs::read(path)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|_| IdentityError::new("invalid bootstrap CA PEM"))?;
+        if certificates.is_empty() {
+            return Err(IdentityError::new(
+                "bootstrap CA file contains no certificates",
+            ));
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    builder
         .build()
         .map_err(|err| IdentityError::new(err.to_string()))
 }
 
 fn service_url(server: &Url, path: &str) -> Result<Url, IdentityError> {
+    crate::config::validate_server_url(server)
+        .map_err(|err| IdentityError::new(err.to_string()))?;
     let mut base = server.clone();
     if !base.path().ends_with('/') {
         let joined = format!("{}/", base.path());

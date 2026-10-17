@@ -28,7 +28,7 @@ kestrel-checks = { path = "../kestrel-checks" }
 kestrel-proto = { path = "../kestrel-proto" }
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1-rustls-tls"] }
 mime_guess = "2"
-minijinja = "2"
+minijinja = { version = "2", features = ["fuel"] }
 promql-parser = "0.4"
 prost = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
@@ -59,6 +59,7 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.16"
+webpki-roots = "1"
 
 [dev-dependencies]
 axum-test = "16"

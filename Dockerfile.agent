@@ -1,0 +1,16 @@
+# A native musl build on each Linux architecture. Build with --platform when
+# the builder has the matching runner or emulator configured.
+FROM rust:alpine AS build
+ARG TARGETARCH
+RUN apk add --no-cache build-base cmake perl pkgconf protobuf-dev
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=kestrel-agent-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=kestrel-agent-${TARGETARCH}-target,target=/src/target \
+    cargo build --locked --release -p kestrel-agent && \
+    test "$(stat -c %s target/release/kestrel-agent)" -lt 15000000 && \
+    cp target/release/kestrel-agent /kestrel-agent
+FROM scratch
+COPY --from=build /kestrel-agent /kestrel-agent
+ENTRYPOINT ["/kestrel-agent"]

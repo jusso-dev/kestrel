@@ -102,4 +102,13 @@ message AgentConfig {
   repeated CheckSpec checks = 2;
   repeated LogSpec logs = 3;
   string etag = 4;
+  repeated ItemSpec items = 5;
+}
+
+// ItemSpec carries built-in, HTTP and Prometheus collection settings.
+message ItemSpec {
+  string key = 1;
+  string kind = 2;
+  uint32 interval_s = 3;
+  string params_json = 4;
 }

@@ -1,0 +1,2 @@
+# Svelte bundles contain significant whitespace inside JavaScript string literals.
+web/build/** linguist-generated=true whitespace=-blank-at-eol

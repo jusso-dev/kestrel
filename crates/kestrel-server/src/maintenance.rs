@@ -1,8 +1,7 @@
 //! Maintenance windows. Recurrence uses an RRULE and is evaluated in the
 //! window's timezone so a weekly local time survives a DST change.
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
-use chrono_tz::Tz;
+use chrono::{DateTime, Duration, Utc};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -56,134 +55,86 @@ fn covers(
 }
 
 fn recurring_contains(window: &Window, rule: &str, now: DateTime<Utc>) -> bool {
-    let Ok(parsed) = parse_weekly(rule) else {
-        return false;
-    };
     let duration = window.ends_at - window.starts_at;
-    if duration <= Duration::zero() {
+    if duration <= Duration::zero() || now < window.starts_at {
         return false;
     }
-    let local_now = now.with_timezone(&parsed.tz);
-    if !parsed.weekdays.contains(&local_now.weekday()) {
-        return false;
-    }
-    let start = parsed
-        .tz
-        .with_ymd_and_hms(
-            local_now.year(),
-            local_now.month(),
-            local_now.day(),
-            parsed.hour,
-            parsed.minute,
-            parsed.second,
+    let definition = if rule.contains("DTSTART") {
+        rule.to_string()
+    } else {
+        format!(
+            "DTSTART:{}\nRRULE:{}",
+            window.starts_at.format("%Y%m%dT%H%M%SZ"),
+            rule.trim_start_matches("RRULE:")
         )
-        .single();
-    let Some(start) = start else {
+    };
+    let Ok(recurrence) = definition.parse::<rrule::RRuleSet>() else {
         return false;
     };
-    let end = start + duration;
-    local_now >= start && local_now < end
-}
-
-struct Weekly {
-    tz: Tz,
-    weekdays: Vec<chrono::Weekday>,
-    hour: u32,
-    minute: u32,
-    second: u32,
-}
-
-fn parse_weekly(rule: &str) -> Result<Weekly, String> {
-    let mut tz = chrono_tz::UTC;
-    let mut hour = 0;
-    let mut minute = 0;
-    let mut second = 0;
-    let mut weekdays = Vec::new();
-    for line in rule.lines() {
-        let line = line.trim();
-        if let Some(start) = line.strip_prefix("DTSTART") {
-            if let Some(zone) = start.strip_prefix(";TZID=") {
-                let (name, time) = zone
-                    .split_once(':')
-                    .ok_or_else(|| "DTSTART is missing a time".to_string())?;
-                tz = name
-                    .parse()
-                    .map_err(|_| format!("unknown timezone {name}"))?;
-                (hour, minute, second) = parse_local_time(time)?;
-            }
-        }
-        let body = line.strip_prefix("RRULE:").unwrap_or(line);
-        if !body.contains("FREQ=") {
-            continue;
-        }
-        let validated = if body.starts_with("FREQ=") {
-            format!("DTSTART:20260101T000000Z\nRRULE:{body}")
-        } else {
-            body.to_string()
-        };
-        let _ = validated
-            .parse::<rrule::RRuleSet>()
-            .map_err(|err| format!("rrule: {err}"))?;
-        for part in body.split(';') {
-            if let Some(days) = part.strip_prefix("BYDAY=") {
-                for day in days.split(',') {
-                    weekdays.push(parse_day(day)?);
-                }
-            }
-        }
-    }
-    if weekdays.is_empty() {
-        return Err("RRULE is missing BYDAY".to_string());
-    }
-    Ok(Weekly {
-        tz,
-        weekdays,
-        hour,
-        minute,
-        second,
-    })
-}
-
-fn parse_local_time(value: &str) -> Result<(u32, u32, u32), String> {
-    if value.len() < 15 {
-        return Err("DTSTART time is too short".to_string());
-    }
-    let time = &value[9..];
-    let hour: u32 = time
-        .get(0..2)
-        .ok_or("hour")?
-        .parse()
-        .map_err(|_| "hour".to_string())?;
-    let minute: u32 = time
-        .get(2..4)
-        .ok_or("minute")?
-        .parse()
-        .map_err(|_| "minute".to_string())?;
-    let second: u32 = time
-        .get(4..6)
-        .ok_or("second")?
-        .parse()
-        .map_err(|_| "second".to_string())?;
-    Ok((hour, minute, second))
-}
-
-fn parse_day(day: &str) -> Result<chrono::Weekday, String> {
-    Ok(match day {
-        "MO" => chrono::Weekday::Mon,
-        "TU" => chrono::Weekday::Tue,
-        "WE" => chrono::Weekday::Wed,
-        "TH" => chrono::Weekday::Thu,
-        "FR" => chrono::Weekday::Fri,
-        "SA" => chrono::Weekday::Sat,
-        "SU" => chrono::Weekday::Sun,
-        _ => return Err(format!("unknown weekday {day}")),
-    })
+    let lower = (now - duration).with_timezone(&rrule::Tz::UTC);
+    let upper = now.with_timezone(&rrule::Tz::UTC);
+    recurrence
+        .after(lower)
+        .before(upper)
+        .all(1024)
+        .dates
+        .into_iter()
+        .any(|start| now >= start.with_timezone(&Utc) && now < start.with_timezone(&Utc) + duration)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
+
+    #[test]
+    fn recurring_windows_obey_start_count_interval_and_cross_midnight() {
+        let start = Utc.with_ymd_and_hms(2026, 10, 12, 23, 0, 0).unwrap();
+        let window = Window {
+            starts_at: start,
+            ends_at: start + Duration::hours(2),
+            rrule: Some("FREQ=WEEKLY;INTERVAL=2;COUNT=2;BYDAY=MO".into()),
+            host_ids: vec![],
+            group_ids: vec![],
+            suppress_problems: true,
+        };
+        assert!(!notifications_suppressed(
+            std::slice::from_ref(&window),
+            None,
+            None,
+            start - Duration::weeks(2)
+        ));
+        assert!(notifications_suppressed(
+            std::slice::from_ref(&window),
+            None,
+            None,
+            start + Duration::hours(1)
+        ));
+        assert!(!notifications_suppressed(
+            std::slice::from_ref(&window),
+            None,
+            None,
+            start + Duration::hours(2)
+        ));
+        assert!(!notifications_suppressed(
+            std::slice::from_ref(&window),
+            None,
+            None,
+            start + Duration::weeks(1)
+        ));
+        assert!(notifications_suppressed(
+            std::slice::from_ref(&window),
+            None,
+            None,
+            start + Duration::weeks(2) + Duration::minutes(30)
+        ));
+        assert!(!notifications_suppressed(
+            &[window],
+            None,
+            None,
+            start + Duration::weeks(4)
+        ));
+    }
 
     #[test]
     fn escalation_maintenance_blocks_notifications() {

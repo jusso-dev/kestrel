@@ -6,6 +6,7 @@ mod api_tokens;
 mod audit;
 mod host_groups;
 mod hosts;
+mod ingest_runtime;
 mod items;
 mod maintenances;
 mod media_types;
@@ -55,7 +56,8 @@ impl TenantId {
 /// Connection pool and the applied migrations.
 #[derive(Clone)]
 pub struct Db {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
+    pub(crate) log_retention_days: i32,
 }
 
 impl Db {
@@ -71,7 +73,10 @@ impl Db {
 
     /// Apply migrations to an existing pool.
     pub async fn from_pool(pool: PgPool) -> Result<Self, ServerError> {
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            log_retention_days: 7,
+        };
         db.migrate().await?;
         Ok(db)
     }

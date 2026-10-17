@@ -1,36 +1,48 @@
-# Validation
+# Validation record
 
-Commands run on this machine while finishing issues 15–32:
+Acceptance work recorded on 17 October 2026. Tests used isolated, disposable PostgreSQL 16, VictoriaMetrics v1.111.0, Mailpit and SNMP fixtures. No production monitoring data or device credentials were used.
 
-- `cargo fmt --all`
-- `cargo clippy --workspace --all-targets -- -D warnings` — no issues
-- `cargo test --workspace -- --test-threads=8` — 113 passed, 1 ignored, 0 failed
-- `npm run build` in `web/` — SvelteKit adapter-static wrote `web/build`
+## Runtime and security
 
-`cargo test` does not run `cargo bench`. The ignored test is `snmp_walks_snmpsim`.
+The server now uses PostgreSQL for API resources, sessions, audit records, ingest sequence numbers and worker queues. Trigger evaluation, notification delivery, forwarding, agentless checks and security outbox replay run as independent background workers. Agent configuration polling, scheduled checks, inventory delivery and loopback Prometheus exposition run in the agent process.
 
-## Not executed
+The integration tests exercise database persistence, tenant and host-group isolation, role checks, template inheritance, discovery ageing, maintenance, escalation acknowledgement, restart deduplication, queue retries and security outbox replay. SMTP delivery uses a real Mailpit fixture; the syslog test verifies TLS trust rejection, an explicitly trusted CA and RFC 5425 octet framing. Notification template tests cover bounded output and rejection of executable template expressions.
 
-These checks need hardware or tools that were not available when the code was written. No numbers below were invented.
+Final Linux checks passed: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`. The workspace run passed **147 tests**, with zero failures and two ignored external SNMP tests; both SNMP tests passed separately against the simulator. The PostgreSQL, VictoriaMetrics and Mailpit environment variables were set during the full run, so those integration checks executed.
 
-| Check | Why it was not run |
+A container smoke test created an administrator with the CLI, signed in through the persisted HTTPS session API, created an enrolment token and configured a fresh agent through stdin. The agent enrolled using the verified private CA and appeared in the authenticated hosts API. The server container runs as a non-root user.
+
+## External acceptance checks
+
+| Check | Observed result |
 | --- | --- |
-| 50,000 samples/s ingest on a 4 vCPU host | No 4 vCPU benchmark host was provisioned. `cargo bench -p kestrel-server --bench ingest` decodes a 1,000-sample batch locally. That is not the throughput acceptance test. |
-| `cross` musl agent builds and Windows MSI (`cargo wix`) | Release builds are described in `docs/ci/release.yml`. They were not executed on Linux, Windows and macOS from this machine. |
-| snmpsim walk | `snmp_walks_snmpsim` is `#[ignore]`. Start the `snmp` compose profile before running it. |
-| `promtool check metrics` | The agent checks the exposition text in-process (`validate_exposition`). `promtool` was not required for the unit tests. |
-| Playwright browser run | `web/tests` describes the UI paths. A browser install was not required for `cargo test`. |
+| Real mTLS ingest, PostgreSQL sequence commit and VictoriaMetrics queries | 3,200,000 samples in 32.139 seconds: **99,567 samples/s**, with the server and load generator constrained to 4 CPUs, 32 agents and 1,000-sample batches. Tenant and host labels and committed sequences were checked. |
+| Linux static agent | x86_64 musl static PIE, stripped, **10,087,744 bytes**, below the 15 MB acceptance limit. |
+| SNMP v2c and v3 | Real simulator get and 64-bit interface walk passed for v2c and SHA256/AES128 v3. The final v3 test used the normal environment and the explicit worker stack, without `RUST_MIN_STACK`. |
+| Nagios-compatible plugins | Unmodified Debian `monitoring-plugins-basic` 2.3.3-5+deb12u2 `check_disk` and `check_http` executed through Kestrel and produced OK checks and parsed perfdata. Package hashes were verified; an executable outside the allowlist was rejected. |
+| Prometheus exposition | A running Linux agent returned non-empty `/metrics`; `promtool check metrics` passed. |
+| Production UI | Seven Playwright browser tests passed against the production static bundle. Svelte check reported zero errors and warnings; production build passed; production dependency audit reported zero vulnerabilities. |
+| OpenAPI | Generated document contains 52 paths and 90 unique operations. TypeScript API generation and the production build passed. |
+| OpenTelemetry SDK | Official Python SDK 1.38.0 exported authenticated OTLP protobuf over verified HTTPS to the final server container. Queries returned counter 7, gauge 42, histogram count 1, sum 0.2 and bucket counts; configured `user_id` attribute dropping was verified. |
+| Official OCSF schema | Fourteen synthetic records emitted by the production Rust mapping passed the official OCSF 1.1.0 validator with **zero errors and warnings**: Detection Finding create/close across five severities and API Activity CRUD. |
+| Windows agent compilation | GNU Windows cross-check passed. This does not establish MSI installation or Windows service operation. |
 
-## Present in libraries, not in the long-running loops
+The ingest load generator is in `crates/kestrel-server/examples/ingest_load.rs`. Reproducible SNMP acceptance is in `scripts/test-snmp.sh`, the original distribution plugin fixture is in `deploy/tests/Dockerfile.monitoring-plugins`, and the SDK demo is in `deploy/tests/otlp_sdk.py` with pinned dependencies alongside it. These checks require explicitly selected test services and Docker contexts; they are not silently run against production.
 
-- The HTTP API catalogue is in memory. Postgres repositories and built-in template seeding run on startup. API login, hosts, sessions and problems are not read back from Postgres after a restart. `kestrel-server admin create` inserts a database user that the memory catalogue does not load.
-- The trigger evaluator, notification job claim, and SIEM forwarder are library functions with tests. `kestrel-server` does not spawn those loops.
-- The agent ships built-in collectors. Config polling, plugin execution and the localhost Prometheus listener are gated in `desired` and are not called from `serve`.
-- Syslog forwarding in tests is TCP with RFC 5425 octet counting. TLS syslog is not implemented.
-- Ingest sequence checks are in memory. `agents.last_seq` is not updated in Postgres.
+VictoriaMetrics applies a default 30-second latency offset to recent instant queries. Kestrel explicitly disables that instant-query cache policy so requested evaluation times are honoured; range-query caching remains available. Storage flushing can still delay visibility briefly, so external acceptance checks poll with a bounded deadline.
 
-## Security notes from the tests
+The local Rust OCSF validator intentionally checks a pinned required-field subset. Full schema acceptance was separately verified at `https://schema.ocsf.io/1.1.0/api/v2/validate` on 17 October 2026; the structured response is recorded in [the OCSF validation report](validation/ocsf-1.1.0-2026-10-17.json). To repeat it, run `cargo run -p kestrel-server --example ocsf > /tmp/kestrel-ocsf-events.json`, then `python3 deploy/tests/validate_ocsf.py /tmp/kestrel-ocsf-events.json`. This sends only synthetic exporter fixtures to the official service and requires network access. A negative test confirmed that a missing class identifier is rejected.
 
-- Passwords are argon2id. Tests reject the wrong password and do not put it in the response body.
-- Webhook signatures use HMAC-SHA256. The documented vector is in the notify tests.
-- Notification and SIEM tests use in-process fakes or a local mock server.
+## Packaging and remaining release gates
+
+Installer syntax and ShellCheck, release recipe YAML and shell syntax, WiX XML, the launchd plist, Compose configuration and Git whitespace checks passed. The recipe requires signing credentials, signs Linux agent binaries and checksums with minisign, and verifies those signatures before uploading artifacts. The macOS recipe requires Developer ID identities and a notarisation profile.
+
+The following release checks remain unverified and must not be represented as completed:
+
+- Actual installation and enrolment on Ubuntu, Debian and RHEL using published release artifacts.
+- Actual Windows MSI installation followed by a running service and successful stop/shutdown.
+- An aarch64 musl artifact build and execution on a matching runner or emulator.
+- A Developer ID signed, notarised macOS package and its installation.
+- Running the documented release recipe with real signing credentials and publishing release artifacts.
+
+These are tracked by packaging issue #31. The Linux artifact and source-level service checks above are useful evidence, but do not replace these platform checks.

@@ -2,7 +2,7 @@
 
 Open-source infrastructure monitoring in Rust. One small agent, one server, no PHP, no Perl. Kestrel aims to replace Zabbix and Nagios with something you can install in five minutes and trust on the internet.
 
-> Status: pre-alpha. The workspace compiles, and features are being built from the [roadmap](#roadmap). See the pinned roadmap issue.
+> Status: pre-alpha. See the [quick start](docs/quickstart.md), [validation record](docs/VALIDATION.md) and open roadmap issues for current capabilities and remaining release checks.
 
 ## Vision
 

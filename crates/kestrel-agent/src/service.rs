@@ -1,8 +1,7 @@
 //! Service wrappers. Windows uses the service control manager. Linux and
 //! macOS use the unit files in `deploy/`.
 
-/// Hint printed by packaging docs. The process still runs in the foreground
-/// when it is not hosted by a service manager.
+/// Run the Windows SCM dispatcher, or the normal foreground agent elsewhere.
 pub fn service_entry() -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -10,8 +9,7 @@ pub fn service_entry() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = foreground_hint();
-        Ok(())
+        crate::run().map_err(|err| err.to_string())
     }
 }
 
@@ -52,16 +50,25 @@ mod windows {
     }
 
     fn run_service() -> Result<(), windows_service::Error> {
-        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let status_handle = service_control_handler::register(NAME, move |control| {
-            if control == ServiceControl::Stop {
-                let _ = shutdown_tx.send(());
+            match control {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    let _ = shutdown_tx.send(true);
+                }
+                ServiceControl::Interrogate => {}
+                _ => return ServiceControlHandlerResult::NotImplemented,
             }
             ServiceControlHandlerResult::NoError
         })?;
         status_handle.set_service_status(status(ServiceState::Running))?;
-        let _ = shutdown_rx.recv_timeout(Duration::from_secs(u64::MAX));
-        status_handle.set_service_status(status(ServiceState::Stopped))?;
+        let result = crate::run_with_shutdown(Some(shutdown_rx));
+        let mut stopped = status(ServiceState::Stopped);
+        if let Err(err) = result {
+            tracing::error!(error=%err,"Windows agent failed");
+            stopped.exit_code = ServiceExitCode::Win32(1);
+        }
+        status_handle.set_service_status(stopped)?;
         Ok(())
     }
 
@@ -69,7 +76,11 @@ mod windows {
         ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
             current_state: current,
-            controls_accepted: ServiceControlAccept::STOP,
+            controls_accepted: if current == ServiceState::Running {
+                ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN
+            } else {
+                ServiceControlAccept::empty()
+            },
             exit_code: ServiceExitCode::Win32(0),
             checkpoint: 0,
             wait_hint: Duration::default(),

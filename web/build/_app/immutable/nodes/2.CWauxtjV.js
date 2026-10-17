@@ -1,0 +1,1 @@
+import{a as r,f as a}from"../chunks/cGgrKGDE.js";import"../chunks/WV9Uo63V.js";import{n as o}from"../chunks/D9sixkBA.js";var s=a('<h1 class="text-2xl">Overview</h1> <p class="mt-2 text-[var(--muted)]">Problems, hosts and the metrics the server has stored for this tenant.</p>',1);function h(t){var e=s();o(2),r(t,e)}export{h as component};

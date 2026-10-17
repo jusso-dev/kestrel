@@ -48,6 +48,7 @@ pub fn compile_agent_config(host: &HostView, templates: &[TemplateDoc]) -> (Agen
     }
     let mut checks = Vec::new();
     let mut logs = Vec::new();
+    let mut configured_items = Vec::new();
     let mut interval = 30u32;
     for item in items.values() {
         interval = interval.min(item.interval_s.max(1));
@@ -92,7 +93,12 @@ pub fn compile_agent_config(host: &HostView, templates: &[TemplateDoc]) -> (Agen
                     });
                 }
             }
-            _ => {}
+            _ => configured_items.push(kestrel_proto::v1::ItemSpec {
+                key: item.key.clone(),
+                kind: item.kind.clone(),
+                interval_s: item.interval_s.max(1),
+                params_json: item.params.to_string(),
+            }),
         }
     }
     let mut config = AgentConfig {
@@ -100,6 +106,7 @@ pub fn compile_agent_config(host: &HostView, templates: &[TemplateDoc]) -> (Agen
         checks,
         logs,
         etag: String::new(),
+        items: configured_items,
     };
     let etag = etag_of(&config);
     config.etag = etag.clone();
@@ -107,19 +114,11 @@ pub fn compile_agent_config(host: &HostView, templates: &[TemplateDoc]) -> (Agen
 }
 
 fn etag_of(config: &AgentConfig) -> String {
+    use prost::Message;
     let mut hasher = Sha256::new();
-    hasher.update(config.interval_s.to_string().as_bytes());
-    for check in &config.checks {
-        hasher.update(check.id.as_bytes());
-        hasher.update(check.interval_s.to_string().as_bytes());
-        for arg in &check.command {
-            hasher.update(arg.as_bytes());
-        }
-    }
-    for log in &config.logs {
-        hasher.update(log.path.as_bytes());
-        hasher.update(log.pattern.as_bytes());
-    }
+    // Length-delimited protobuf fields distinguish argument boundaries and cover
+    // every effective setting, including timeouts and item parameters.
+    hasher.update(config.encode_to_vec());
     format!(
         "\"{}\"",
         data_encoding::HEXLOWER.encode(hasher.finalize().as_slice())
@@ -151,49 +150,25 @@ pub fn builtin_templates() -> Vec<TemplateDoc> {
 }
 
 pub async fn ensure_builtin_templates(db: &crate::db::Db) -> Result<(), crate::ServerError> {
-    let tenant = crate::db::TenantId::default_tenant();
-    let existing = db.list_templates(&tenant).await?;
+    let mut tx = db.pool.begin().await.map_err(crate::db::db_err)?;
+    seed_builtin_templates(&mut tx, crate::store::DEFAULT_TENANT_ID).await?;
+    tx.commit().await.map_err(crate::db::db_err)
+}
+
+pub(crate) async fn seed_builtin_templates(
+    conn: &mut sqlx::PgConnection,
+    tenant: uuid::Uuid,
+) -> Result<(), crate::ServerError> {
     for doc in builtin_templates() {
-        if existing.iter().any(|template| template.name == doc.name) {
+        let id:Option<uuid::Uuid>=sqlx::query_scalar("INSERT INTO templates (tenant_id,name,description) VALUES ($1,$2,$3) ON CONFLICT (tenant_id,name) DO NOTHING RETURNING id").bind(tenant).bind(doc.name).bind(doc.description).fetch_optional(&mut *conn).await.map_err(crate::db::db_err)?;
+        let Some(id) = id else {
             continue;
-        }
-        let template = db
-            .insert_template(
-                &tenant,
-                crate::db::NewTemplate {
-                    name: doc.name,
-                    description: doc.description,
-                },
-            )
-            .await?;
+        };
         for item in doc.items {
-            db.insert_item(
-                &tenant,
-                crate::db::NewItem {
-                    template_id: template.id,
-                    key: item.key,
-                    kind: item.kind,
-                    interval_s: i32::try_from(item.interval_s).unwrap_or(30),
-                    params: item.params,
-                },
-            )
-            .await?;
+            sqlx::query("INSERT INTO items (tenant_id,template_id,key,kind,interval_s,params) VALUES ($1,$2,$3,$4,$5,$6)").bind(tenant).bind(id).bind(item.key).bind(item.kind).bind(item.interval_s as i32).bind(item.params).execute(&mut *conn).await.map_err(crate::db::db_err)?;
         }
         for trigger in doc.triggers {
-            db.insert_trigger(
-                &tenant,
-                crate::db::NewTrigger {
-                    template_id: Some(template.id),
-                    host_id: None,
-                    name: trigger.name,
-                    expression: trigger.expression,
-                    severity: trigger.severity,
-                    for_seconds: i32::try_from(trigger.for_seconds).unwrap_or(0),
-                    recovery_expr: None,
-                    labels: serde_json::json!({}),
-                },
-            )
-            .await?;
+            sqlx::query("INSERT INTO triggers (tenant_id,template_id,name,expression,severity,for_seconds) VALUES ($1,$2,$3,$4,$5,$6)").bind(tenant).bind(id).bind(trigger.name).bind(trigger.expression).bind(trigger.severity).bind(trigger.for_seconds as i32).execute(&mut *conn).await.map_err(crate::db::db_err)?;
         }
     }
     Ok(())
@@ -206,6 +181,37 @@ pub fn template_names(docs: &[TemplateDoc]) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_compile_etag_covers_timeouts_item_params_and_argument_boundaries() {
+        let host = HostView {
+            name: "host".into(),
+            overrides: BTreeMap::new(),
+        };
+        let mut template = TemplateDoc {
+            name: "checks".into(),
+            description: String::new(),
+            items: vec![ItemSpec {
+                key: "command".into(),
+                kind: "command".into(),
+                interval_s: 30,
+                params: serde_json::json!({"command":["ab","c"],"timeout_s":5}),
+            }],
+            triggers: vec![],
+        };
+        let (_, first) = compile_agent_config(&host, &[template.clone()]);
+        template.items[0].params["command"] = serde_json::json!(["a", "bc"]);
+        let (_, second) = compile_agent_config(&host, &[template.clone()]);
+        assert_ne!(first, second);
+        template.items[0].params["timeout_s"] = serde_json::json!(10);
+        let (_, third) = compile_agent_config(&host, &[template.clone()]);
+        assert_ne!(second, third);
+        template.items[0].kind = "http".into();
+        template.items[0].params = serde_json::json!({"url":"https://first.test"});
+        let (_, fourth) = compile_agent_config(&host, &[template.clone()]);
+        template.items[0].params["url"] = serde_json::json!("https://second.test");
+        assert_ne!(fourth, compile_agent_config(&host, &[template]).1);
+    }
 
     #[test]
     fn config_compile_is_stable_and_yaml_round_trips() {

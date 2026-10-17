@@ -38,6 +38,8 @@ fn server_config(dir: &Path) -> ServerConfigFile {
         public_url: Url::parse("https://127.0.0.1/").unwrap(),
         smtp: None,
         data_dir: dir.join("data"),
+        log_retention_days: 7,
+        otlp_drop_attributes: vec!["user_id".to_string()],
     }
 }
 
@@ -61,9 +63,9 @@ fn dev_csr() -> String {
     params.serialize_request(&key).unwrap().pem().unwrap()
 }
 
-async fn post_enrol(addr: SocketAddr, token: &str, csr_pem: &str) -> u16 {
+async fn post_enrol(addr: SocketAddr, token: &str, csr_pem: &str, ca: &Path) -> u16 {
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(reqwest::Certificate::from_pem(&std::fs::read(ca).unwrap()).unwrap())
         .use_rustls_tls()
         .timeout(Duration::from_secs(10))
         .build()
@@ -146,6 +148,7 @@ async fn enrol_flow_agent_ships_over_mtls() {
         server_url: Url::parse(&format!("https://{}/", server.addr)).unwrap(),
         data_dir: agent_dir.clone(),
         enrol_token: Some(token.clone()),
+        bootstrap_ca_path: Some(dir.join("ca.crt")),
         interval_s: 30,
         buffer_max_mb: 16,
         labels: BTreeMap::new(),
@@ -166,7 +169,9 @@ async fn enrol_flow_agent_ships_over_mtls() {
 
     let ingest = server.ingest_addr.expect("ingest listener");
     let open = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(dir.join("ca.crt")).unwrap()).unwrap(),
+        )
         .use_rustls_tls()
         .timeout(Duration::from_secs(10))
         .build()
@@ -187,7 +192,7 @@ async fn enrol_flow_agent_ships_over_mtls() {
         200
     );
 
-    let reuse = post_enrol(server.addr, &token, &dev_csr()).await;
+    let reuse = post_enrol(server.addr, &token, &dev_csr(), &dir.join("ca.crt")).await;
     assert_eq!(reuse, 401);
     admin::revoke_agent(&dir.join("data"), identity.agent_id.parse().unwrap()).unwrap();
     let revoked = shipper.post_bytes(sample_batch()).await.unwrap();
@@ -204,7 +209,7 @@ async fn enrol_rejects_expired_token() {
         .expect("server start timed out")
         .unwrap();
     let token = admin::create_token(&dir.join("data"), None, Duration::ZERO).unwrap();
-    let status = post_enrol(server.addr, &token, &dev_csr()).await;
+    let status = post_enrol(server.addr, &token, &dev_csr(), &dir.join("ca.crt")).await;
     assert_eq!(status, 401);
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -218,9 +223,9 @@ async fn enrol_rejects_reused_token() {
         .expect("server start timed out")
         .unwrap();
     let token = admin::create_token(&dir.join("data"), None, Duration::from_secs(3600)).unwrap();
-    let first = post_enrol(server.addr, &token, &dev_csr()).await;
+    let first = post_enrol(server.addr, &token, &dev_csr(), &dir.join("ca.crt")).await;
     assert_eq!(first, 200);
-    let second = post_enrol(server.addr, &token, &dev_csr()).await;
+    let second = post_enrol(server.addr, &token, &dev_csr(), &dir.join("ca.crt")).await;
     assert_eq!(second, 401);
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
@@ -240,6 +245,7 @@ async fn enrol_rejects_revoked_certificate() {
         server_url: Url::parse(&format!("https://{}/", server.addr)).unwrap(),
         data_dir: agent_dir,
         enrol_token: Some(token),
+        bootstrap_ca_path: Some(dir.join("ca.crt")),
         interval_s: 30,
         buffer_max_mb: 16,
         labels: BTreeMap::new(),

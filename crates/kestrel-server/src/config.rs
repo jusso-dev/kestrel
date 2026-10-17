@@ -89,6 +89,17 @@ pub struct ServerConfigFile {
     pub smtp: Option<SmtpConfig>,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
+    #[serde(default = "default_log_retention_days")]
+    pub log_retention_days: u32,
+    #[serde(default = "default_otlp_drop_attributes")]
+    pub otlp_drop_attributes: Vec<String>,
+}
+
+fn default_log_retention_days() -> u32 {
+    7
+}
+fn default_otlp_drop_attributes() -> Vec<String> {
+    vec!["user_id".to_string()]
 }
 
 /// Configuration could not be loaded. The message names the missing field.

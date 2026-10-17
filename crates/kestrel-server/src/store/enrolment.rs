@@ -39,12 +39,54 @@ struct AgentRecord {
     cert_serial: String,
     cert_not_after: String,
     revoked_at: Option<String>,
+    #[serde(default)]
+    host_group_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct EnrolledAgent {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub cert_serial: String,
+    pub cert_not_after: String,
+    pub host_group_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct FileState {
     tokens: Vec<EnrolToken>,
     agents: Vec<AgentRecord>,
+    #[serde(default)]
+    security_events: Vec<AgentSecurityEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AgentSecurityEvent {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub agent_id: Uuid,
+    pub hostname: String,
+    pub kind: String,
+    pub observed_at: String,
+}
+
+fn security_event(
+    state: &mut FileState,
+    agent: &AgentRecord,
+    kind: &str,
+) -> Result<(), ServerError> {
+    state.security_events.push(AgentSecurityEvent {
+        id: Uuid::new_v4(),
+        tenant_id: agent.tenant_id,
+        agent_id: agent.id,
+        hostname: agent.hostname.clone(),
+        kind: kind.to_string(),
+        observed_at: format_time(OffsetDateTime::now_utc())?,
+    });
+    Ok(())
 }
 
 pub struct EnrolCommit {
@@ -80,6 +122,15 @@ impl Directory {
         group: Option<String>,
         ttl: Duration,
     ) -> Result<String, ServerError> {
+        self.create_token_for(DEFAULT_TENANT_ID, group, ttl)
+    }
+
+    pub fn create_token_for(
+        &self,
+        tenant_id: Uuid,
+        group: Option<String>,
+        ttl: Duration,
+    ) -> Result<String, ServerError> {
         let mut raw = [0u8; 32];
         getrandom::getrandom(&mut raw).map_err(|err| ServerError::new(err.to_string()))?;
         let token = data_encoding::BASE32_NOPAD.encode(&raw);
@@ -93,7 +144,7 @@ impl Directory {
         };
         let record = EnrolToken {
             id: Uuid::new_v4(),
-            tenant_id: DEFAULT_TENANT_ID,
+            tenant_id,
             token_hash: HEXLOWER.encode(&hash_token(&token)),
             host_group_id: group,
             expires_at: format_time(expires)?,
@@ -120,7 +171,8 @@ impl Directory {
             state.tokens[index].used_at = Some(format_time(OffsetDateTime::now_utc())?);
             state.agents.push(AgentRecord {
                 id: commit.agent_id,
-                tenant_id: DEFAULT_TENANT_ID,
+                tenant_id: state.tokens[index].tenant_id,
+                host_group_id: state.tokens[index].host_group_id.clone(),
                 hostname: commit.hostname,
                 os: commit.os,
                 arch: commit.arch,
@@ -128,6 +180,12 @@ impl Directory {
                 cert_not_after: commit.cert_not_after,
                 revoked_at: None,
             });
+            let agent = state
+                .agents
+                .last()
+                .cloned()
+                .ok_or_else(|| ServerError::new("agent missing after enrolment"))?;
+            security_event(state, &agent, "agent.enrolled")?;
             Ok(())
         })
     }
@@ -147,6 +205,8 @@ impl Directory {
             }
             agent.cert_serial = cert_serial.to_string();
             agent.cert_not_after = cert_not_after.to_string();
+            let agent = agent.clone();
+            security_event(state, &agent, "agent.certificate_renewed")?;
             Ok(())
         })
     }
@@ -176,6 +236,27 @@ impl Directory {
         .flatten()
     }
 
+    pub fn agent_details(&self, agent_id: Uuid) -> Option<EnrolledAgent> {
+        self.with_ref(|state| {
+            Ok(state
+                .agents
+                .iter()
+                .find(|agent| agent.id == agent_id && agent.revoked_at.is_none())
+                .map(|agent| EnrolledAgent {
+                    id: agent.id,
+                    tenant_id: agent.tenant_id,
+                    hostname: agent.hostname.clone(),
+                    os: agent.os.clone(),
+                    arch: agent.arch.clone(),
+                    cert_serial: agent.cert_serial.clone(),
+                    cert_not_after: agent.cert_not_after.clone(),
+                    host_group_id: agent.host_group_id.clone(),
+                }))
+        })
+        .ok()
+        .flatten()
+    }
+
     pub fn revoke(&self, agent_id: Uuid) -> Result<(), ServerError> {
         self.with_mut(|state| {
             let Some(agent) = state.agents.iter_mut().find(|agent| agent.id == agent_id) else {
@@ -183,7 +264,38 @@ impl Directory {
             };
             if agent.revoked_at.is_none() {
                 agent.revoked_at = Some(format_time(OffsetDateTime::now_utc())?);
+                let agent = agent.clone();
+                security_event(state, &agent, "agent.revoked")?;
             }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn security_meta(&self, id: Uuid) -> Option<Uuid> {
+        self.with_ref(|state| {
+            Ok(state
+                .agents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.tenant_id))
+        })
+        .ok()
+        .flatten()
+    }
+    pub(crate) fn record_security_rejection(&self, id: Uuid) -> Result<(), ServerError> {
+        self.with_mut(|state| {
+            let Some(agent) = state.agents.iter().find(|agent| agent.id == id).cloned() else {
+                return Ok(());
+            };
+            security_event(state, &agent, "agent.authentication_rejected")
+        })
+    }
+    pub(crate) fn pending_security_events(&self) -> Result<Vec<AgentSecurityEvent>, ServerError> {
+        self.with_ref(|state| Ok(state.security_events.iter().take(100).cloned().collect()))
+    }
+    pub(crate) fn ack_security_event(&self, id: Uuid) -> Result<(), ServerError> {
+        self.with_mut(|state| {
+            state.security_events.retain(|event| event.id != id);
             Ok(())
         })
     }

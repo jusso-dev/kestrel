@@ -30,13 +30,60 @@ pub fn filter_matches(value: &str, filter: &str) -> bool {
 }
 
 pub fn prototype_item(prototype: &str, labels: &BTreeMap<String, String>) -> Value {
-    let expanded = expand_macros(prototype, labels);
-    serde_json::from_str(&expanded).unwrap_or(Value::String(expanded))
+    fn expand(value: &mut Value, labels: &BTreeMap<String, String>, expression: bool) {
+        match value {
+            Value::String(text) => {
+                let replacements = labels
+                    .iter()
+                    .map(|(key, value)| {
+                        let replacement = if expression {
+                            let quoted = serde_json::to_string(value).unwrap();
+                            quoted[1..quoted.len() - 1].to_string()
+                        } else {
+                            value.clone()
+                        };
+                        (key.clone(), replacement)
+                    })
+                    .collect();
+                *text = expand_macros(text, &replacements);
+            }
+            Value::Object(object) => {
+                for (key, value) in object {
+                    expand(value, labels, key == "expression" || key == "recovery_expr");
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    expand(value, labels, expression);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(prototype) else {
+        return Value::String(expand_macros(prototype, labels));
+    };
+    expand(&mut value, labels, false);
+    value
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_labels_cannot_escape_json_or_promql_strings() {
+        let labels = BTreeMap::from([(
+            "MOUNT".to_string(),
+            "/data\"} or evil{host=\"other".to_string(),
+        )]);
+        let prototype=serde_json::json!({"key":"disk[{#MOUNT}]","expression":"metric{mount=\"{#MOUNT}\"} > 0"}).to_string();
+        let item = prototype_item(&prototype, &labels);
+        assert!(item.is_object());
+        let expression = item["expression"].as_str().unwrap();
+        assert!(expression.contains("\\\""));
+        assert!(crate::promql::inject_scope(expression, "tenant", None).is_ok());
+    }
 
     #[test]
     fn discovery_expands_mount_macros_and_drops_lost_entities() {
