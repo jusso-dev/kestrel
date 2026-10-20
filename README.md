@@ -6,7 +6,7 @@ Open-source infrastructure monitoring in Rust. One small agent, one server, no P
 
 ## Vision
 
-Zabbix and Nagios run a huge share of the world's monitoring, but they show their age: heavy setup, legacy web UIs, plaintext agents and C codebases with long CVE histories. Kestrel keeps what people love (agents, templates, triggers, Nagios plugins) and adds what they now expect: mTLS by default, Prometheus and OpenTelemetry compatibility, multi-tenancy for MSPs and a modern web UI. Events can be forwarded to a SIEM such as [Wedgetail](https://github.com/yumaitau/wedgetail).
+Zabbix and Nagios run a huge share of the world's monitoring, but they show their age: heavy setup, legacy web UIs, plaintext agents and C codebases with long CVE histories. Kestrel keeps what people love (agents, templates, triggers, Nagios plugins) and adds what they now expect: mTLS by default, Prometheus and OpenTelemetry compatibility, multi-tenancy for MSPs and a modern web UI. Events can be forwarded to your SIEM.
 
 ## Features (planned for v1)
 
