@@ -65,6 +65,28 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         .await
         .unwrap();
     let host_id = Uuid::parse_str(host["id"].as_str().unwrap()).unwrap();
+    let trigger: Uuid = sqlx::query_scalar("INSERT INTO triggers (tenant_id,host_id,name,expression,severity) VALUES ($1,$2,'CPU saturated','up == 0','high') RETURNING id")
+        .bind(tenant).bind(host_id).fetch_one(&db.pool).await.unwrap();
+    for status in ["problem", "resolved"] {
+        sqlx::query("INSERT INTO problems (tenant_id,trigger_id,host_id,status,severity) VALUES ($1,$2,$3,$4,'high')")
+            .bind(tenant).bind(trigger).bind(host_id).bind(status).execute(&db.pool).await.unwrap();
+    }
+    let open = state
+        .pg_list(&principal, "problem", 50, None, Some("problem"))
+        .await
+        .unwrap();
+    assert_eq!(open["items"].as_array().unwrap().len(), 1);
+    assert_eq!(open["items"][0]["name"], "CPU saturated on web-1");
+    assert_eq!(
+        state
+            .pg_list(&principal, "problem", 50, None, None)
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let dashboard = state
         .pg_insert(
             &principal,
@@ -109,7 +131,7 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         .unwrap()
         .is_some());
     assert!(state
-        .pg_list(&principal, "token", 50, None)
+        .pg_list(&principal, "token", 50, None, None)
         .await
         .unwrap()
         .to_string()
@@ -152,7 +174,10 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     scoped.role = "operator".into();
     scoped.host_group_id = Some(Uuid::new_v4());
     assert_eq!(
-        state.pg_list(&scoped, "host", 50, None).await.unwrap()["items"]
+        state
+            .pg_list(&scoped, "host", 50, None, None)
+            .await
+            .unwrap()["items"]
             .as_array()
             .unwrap()
             .len(),
@@ -160,7 +185,10 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     );
     scoped.host_group_id = Some(Uuid::parse_str(group["id"].as_str().unwrap()).unwrap());
     assert_eq!(
-        state.pg_list(&scoped, "host", 50, None).await.unwrap()["items"]
+        state
+            .pg_list(&scoped, "host", 50, None, None)
+            .await
+            .unwrap()["items"]
             .as_array()
             .unwrap()
             .len(),

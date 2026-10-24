@@ -16,7 +16,7 @@ Zabbix and Nagios run a huge share of the world's monitoring, but they show thei
 - Exposes and scrapes the Prometheus exposition format
 - Push over mTLS with an on-disk offline buffer
 - Auto-discovery of disks, interfaces and services
-- Runs with minimal privileges
+- Runs as a dedicated `kestrel` user under systemd (the macOS and Windows packages currently run as root and `LocalSystem`, see [Architecture](docs/ARCHITECTURE.md#agent))
 
 **Server** (`kestrel-server`, axum)
 - Time series storage via VictoriaMetrics (see ADR 0002), config in PostgreSQL

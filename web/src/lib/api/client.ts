@@ -10,14 +10,14 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   return response.json();
 }
-export type Resource = { id: string; name?: string; status?: string; severity?: string; acknowledged?: boolean; acknowledged_at?: string | null };
+export type Resource = { id: string; name?: string; status?: string; severity?: string; acknowledged_at?: string | null };
 export type List<T> = { items: T[]; next?: string | null };
-export async function list<T>(path: string): Promise<T[]> {
+export async function list<T>(path: string, query: Record<string, string> = {}): Promise<T[]> {
   const items: T[] = [];
   const seen = new Set<string>();
   let cursor: string | undefined;
   do {
-    const params = new URLSearchParams({ limit: '200' });
+    const params = new URLSearchParams({ ...query, limit: '200' });
     if (cursor) params.set('cursor', cursor);
     const page = await request<List<T>>(path + '?' + params);
     items.push(...page.items);
