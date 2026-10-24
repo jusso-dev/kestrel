@@ -256,6 +256,7 @@ fn new_csr() -> Result<(String, String), IdentityError> {
 }
 
 fn load(data_dir: &Path) -> Result<Option<Identity>, IdentityError> {
+    recover_staged(data_dir)?;
     let paths = paths(data_dir);
     let present = [
         paths.key.is_file(),
@@ -287,6 +288,16 @@ struct IdentityPaths {
     ca: PathBuf,
 }
 
+impl IdentityPaths {
+    fn pairs(&self) -> [(PathBuf, &PathBuf); 3] {
+        [
+            (staged(&self.key), &self.key),
+            (staged(&self.cert), &self.cert),
+            (staged(&self.ca), &self.ca),
+        ]
+    }
+}
+
 fn paths(data_dir: &Path) -> IdentityPaths {
     IdentityPaths {
         key: data_dir.join("agent.key"),
@@ -295,15 +306,94 @@ fn paths(data_dir: &Path) -> IdentityPaths {
     }
 }
 
+fn staged(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".next");
+    PathBuf::from(name)
+}
+
+/// Present once every staged file of a new generation is durable on disk.
+fn commit_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("identity.commit")
+}
+
+/// Save key, certificate and CA as one generation.
+///
+/// The new set is staged beside the live files and fsynced, then a commit
+/// marker is written. Only after that are the staged files renamed over the
+/// live ones. A crash before the marker leaves the previous identity intact;
+/// a crash after it is rolled forward by [`recover_staged`] on the next load.
 fn save(data_dir: &Path, identity: &Identity) -> Result<(), IdentityError> {
+    std::fs::create_dir_all(data_dir)?;
     let paths = paths(data_dir);
-    perms::write_private_key(&paths.key, &identity.key_pem)?;
-    perms::write_certificate(&paths.cert, &identity.cert_pem)?;
-    perms::write_certificate(&paths.ca, &identity.ca_pem)?;
+    let marker = commit_marker(data_dir);
+    // Any leftover staging from an interrupted attempt is incomplete.
+    recover_staged(data_dir)?;
+    let [(key_next, _), (cert_next, _), (ca_next, _)] = paths.pairs();
+    perms::write_private_key(&key_next, &identity.key_pem)?;
+    perms::write_certificate(&cert_next, &identity.cert_pem)?;
+    perms::write_certificate(&ca_next, &identity.ca_pem)?;
+    sync_dir(data_dir)?;
+    write_synced(&marker, b"")?;
+    sync_dir(data_dir)?;
+    promote_staged(data_dir)?;
     let tmp = data_dir.join("agent_id.tmp");
     std::fs::write(&tmp, &identity.agent_id)?;
     replace_file(&tmp, &data_dir.join("agent_id"))?;
     Ok(())
+}
+
+/// Finish or discard a staged identity generation left by an interrupted save.
+fn recover_staged(data_dir: &Path) -> Result<(), IdentityError> {
+    if commit_marker(data_dir).is_file() {
+        tracing::warn!("completing an interrupted certificate update");
+        return promote_staged(data_dir);
+    }
+    for (next, _) in paths(data_dir).pairs() {
+        if next.exists() {
+            tracing::warn!(path = %next.display(), "discarding incomplete certificate update");
+            std::fs::remove_file(&next)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rename every staged file into place, then drop the commit marker.
+/// Safe to repeat: files already promoted are skipped.
+fn promote_staged(data_dir: &Path) -> Result<(), IdentityError> {
+    for (next, live) in paths(data_dir).pairs() {
+        if next.exists() {
+            replace_file(&next, live)?;
+        }
+    }
+    sync_dir(data_dir)?;
+    let marker = commit_marker(data_dir);
+    if marker.exists() {
+        std::fs::remove_file(&marker)?;
+    }
+    sync_dir(data_dir)?;
+    Ok(())
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Make renames in `dir` durable. Directories cannot be opened for sync on
+/// Windows, where rename durability is left to the filesystem.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -423,6 +513,78 @@ mod tests {
         assert!(needs_renew(0, 90 * day, 60 * day));
         assert!(needs_renew(0, 90 * day, 89 * day));
         assert!(!needs_renew(1_000, 1_000 + 90 * day, 1_000));
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kestrel-agent-{name}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn identity(tag: &str) -> Identity {
+        Identity {
+            agent_id: format!("id-{tag}"),
+            cert_pem: format!("cert-{tag}"),
+            key_pem: format!("key-{tag}"),
+            ca_pem: format!("ca-{tag}"),
+        }
+    }
+
+    fn live(dir: &Path) -> [String; 3] {
+        let paths = paths(dir);
+        [
+            std::fs::read_to_string(&paths.key).unwrap(),
+            std::fs::read_to_string(&paths.cert).unwrap(),
+            std::fs::read_to_string(&paths.ca).unwrap(),
+        ]
+    }
+
+    #[test]
+    fn save_replaces_the_whole_set_and_leaves_no_staging() {
+        let dir = scratch_dir("save");
+        save(&dir, &identity("old")).unwrap();
+        save(&dir, &identity("new")).unwrap();
+        assert_eq!(live(&dir), ["key-new", "cert-new", "ca-new"]);
+        for (next, _) in paths(&dir).pairs() {
+            assert!(!next.exists(), "{}", next.display());
+        }
+        assert!(!commit_marker(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uncommitted_staging_is_discarded_and_previous_pair_kept() {
+        let dir = scratch_dir("uncommitted");
+        save(&dir, &identity("old")).unwrap();
+        // Crash after staging the key and certificate but before the marker.
+        let paths = paths(&dir);
+        std::fs::write(staged(&paths.key), "key-new").unwrap();
+        std::fs::write(staged(&paths.cert), "cert-new").unwrap();
+        recover_staged(&dir).unwrap();
+        assert_eq!(live(&dir), ["key-old", "cert-old", "ca-old"]);
+        assert!(!staged(&paths.key).exists());
+        assert!(!staged(&paths.cert).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn committed_staging_is_rolled_forward_after_partial_promotion() {
+        let dir = scratch_dir("committed");
+        save(&dir, &identity("old")).unwrap();
+        // Crash after the marker, with only the key promoted so far.
+        let paths = paths(&dir);
+        std::fs::write(&paths.key, "key-new").unwrap();
+        std::fs::write(staged(&paths.cert), "cert-new").unwrap();
+        std::fs::write(staged(&paths.ca), "ca-new").unwrap();
+        std::fs::write(commit_marker(&dir), "").unwrap();
+        recover_staged(&dir).unwrap();
+        assert_eq!(live(&dir), ["key-new", "cert-new", "ca-new"]);
+        assert!(!commit_marker(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

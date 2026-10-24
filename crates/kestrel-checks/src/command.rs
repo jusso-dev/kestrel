@@ -2,6 +2,10 @@
 //!
 //! The executable must resolve inside a plugin directory. The process is
 //! spawned directly, with no shell, and is killed when the timeout fires.
+//! On Unix the plugin leads its own process group, and the whole group is
+//! killed on timeout or when the check future is dropped, so descendants do
+//! not outlive it. On Windows only the direct child is killed (best effort
+//! via `kill_on_drop`); descendants may survive.
 
 use crate::perfdata::{parse_perfdata, PerfPoint};
 use crate::sample;
@@ -116,14 +120,16 @@ pub async fn run_command(
 ) -> Result<CommandOutput, CommandError> {
     let exe = resolve_executable(&check.command, plugin_dirs)?;
     let args = &check.command[1..];
-    let mut child = match Command::new(&exe)
+    let mut command = Command::new(&exe);
+    command
         .args(args)
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             return Ok(unknown(
@@ -133,6 +139,9 @@ pub async fn run_command(
             ))
         }
     };
+    // Declared after `child` so it drops first, while the leader is unreaped
+    // and its pid (the group id) cannot have been reused.
+    let mut group = GroupKill::new(child.id());
     let timeout = check.timeout.max(Duration::from_millis(1));
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
@@ -152,10 +161,13 @@ pub async fn run_command(
             ))
         }
         Err(_) => {
+            group.kill();
             let _ = child.kill().await;
             return Ok(unknown(check, "timed out", now_ms));
         }
     };
+    // The leader has been reaped; its pid may be reused from here on.
+    group.disarm();
     let code = status.code().unwrap_or(3);
     let state = CheckState::from_exit_code(code);
     let mut text = String::from_utf8_lossy(&stdout).into_owned();
@@ -172,6 +184,43 @@ pub async fn run_command(
         perfdata: perfdata.to_string(),
         samples,
     })
+}
+
+/// Kills the plugin's process group when dropped unless disarmed.
+struct GroupKill {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pgid: Option<u32>,
+}
+
+impl GroupKill {
+    fn new(pid: Option<u32>) -> Self {
+        Self { pgid: pid }
+    }
+
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.and_then(|pid| libc::pid_t::try_from(pid).ok()) {
+            if pgid > 0 {
+                // Safety: killpg only sends a signal. The group was created
+                // by `process_group(0)` for this plugin and its leader is not
+                // yet reaped, so the id still names that group.
+                unsafe {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
+            }
+        }
+        self.pgid = None;
+    }
+
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 async fn read_capped(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
@@ -321,6 +370,90 @@ mod tests {
             .unwrap();
         assert_eq!(output.state, CheckState::Unknown);
         assert_eq!(output.output, "timed out");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    fn spawner(dir: &Path, pid_file: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("check_spawn.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nsleep 30\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(pid_file: &Path) -> libc::pid_t {
+        for _ in 0..1000 {
+            if let Ok(text) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = text.trim().parse() {
+                    return pid;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("plugin did not record its background pid");
+    }
+
+    #[cfg(unix)]
+    async fn assert_gone(pid: libc::pid_t) {
+        for _ in 0..1000 {
+            // Safety: signal 0 only checks that the pid exists.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("descendant {pid} survived the plugin");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_timeout_kills_plugin_descendants() {
+        let dir = plugin_dir("descendants-timeout");
+        let pid_file = dir.join("bg.pid");
+        let check = CommandCheck {
+            id: "spawn".to_string(),
+            command: vec![spawner(&dir, &pid_file).display().to_string()],
+            timeout: Duration::from_secs(5),
+            interval: Duration::from_secs(60),
+        };
+        let output = run_command(&check, std::slice::from_ref(&dir), 1)
+            .await
+            .unwrap();
+        assert_eq!(output.output, "timed out");
+        assert_gone(wait_for_pid(&pid_file).await).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_cancellation_kills_plugin_descendants() {
+        let dir = plugin_dir("descendants-cancel");
+        let pid_file = dir.join("bg.pid");
+        let check = CommandCheck {
+            id: "spawn".to_string(),
+            command: vec![spawner(&dir, &pid_file).display().to_string()],
+            timeout: Duration::from_secs(60),
+            interval: Duration::from_secs(60),
+        };
+        let dirs = [dir.clone()];
+        let mut running = Box::pin(run_command(&check, &dirs, 1));
+        let pid = tokio::select! {
+            _ = &mut running => panic!("plugin finished early"),
+            pid = wait_for_pid(&pid_file) => pid,
+        };
+        drop(running);
+        assert_gone(pid).await;
         let _ = std::fs::remove_dir_all(dir);
     }
 }

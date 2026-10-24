@@ -24,6 +24,9 @@ rcgen = { version = "0.13", features = ["pem"] }
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Default features include the async-io runtime the blocking proxy sits on.
 # zbus 4 refuses to compile without async-io or tokio.

@@ -11,6 +11,7 @@ figment = { version = "0.10", features = ["toml", "env"] }
 getrandom = "0.2"
 kestrel-checks = { path = "../kestrel-checks" }
 kestrel-proto = { path = "../kestrel-proto" }
+prost = "0.13"
 rcgen = { version = "0.13", features = ["pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls-pemfile = "2"

@@ -142,6 +142,55 @@ pub async fn poll_config(
     }
 }
 
+/// Encoded-size budget for one log batch, well under the server's 8 MiB
+/// decoded-batch limit.
+const LOG_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
+/// Entry budget for one log batch, under the server's 10 000 log limit.
+const LOG_BATCH_MAX_EVENTS: usize = 5_000;
+
+/// Split `events` into consecutive chunks that each fit one log batch.
+fn chunk_logs(events: &[v1::LogEvent]) -> Vec<std::ops::Range<usize>> {
+    use prost::Message;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut bytes = 0;
+    for (index, event) in events.iter().enumerate() {
+        // Field tag plus length prefix of the repeated `logs` entry.
+        let size = event.encoded_len() + 16;
+        if index > start
+            && (bytes + size > LOG_BATCH_MAX_BYTES || index - start >= LOG_BATCH_MAX_EVENTS)
+        {
+            chunks.push(start..index);
+            start = index;
+            bytes = 0;
+        }
+        bytes += size;
+    }
+    if start < events.len() {
+        chunks.push(start..events.len());
+    }
+    chunks
+}
+
+/// Append `pending` log events as size-bounded batches. Appended events are
+/// removed from `pending`; returns `true` once every event is buffered.
+fn append_logs(buffer: &Mutex<Buffer>, pending: &mut Vec<v1::LogEvent>, agent_id: &str) -> bool {
+    let mut appended = 0;
+    for range in chunk_logs(pending) {
+        let end = range.end;
+        let batch = v1::Batch {
+            logs: pending[range].to_vec(),
+            ..Default::default()
+        };
+        if !append(buffer, batch, agent_id) {
+            break;
+        }
+        appended = end;
+    }
+    pending.drain(..appended);
+    pending.is_empty()
+}
+
 fn append(buffer: &Mutex<Buffer>, mut batch: v1::Batch, agent_id: &str) -> bool {
     batch.agent_id = agent_id.to_string();
     if let Err(err) = buffer
@@ -196,8 +245,8 @@ fn schedule(
                     if pending.is_empty() {
                         for tailer in &mut tailers {match tailer.poll(now_ms()) {Ok(logs)=>pending.extend(logs),Err(err)=>tracing::warn!(error=%err,"log tail failed")}}
                     }
-                    if pending.is_empty() || append(&buffer,v1::Batch{logs:pending.clone(),..Default::default()},&id) {
-                        pending.clear();
+                    // Offsets are checkpointed only once every chunk is buffered.
+                    if pending.is_empty() || append_logs(&buffer,&mut pending,&id) {
                         if let Err(err)=kestrel_checks::save_log_offsets(&dir,&tailers) {tracing::warn!(error=%err,"could not checkpoint logs");}
                     }
                 }
@@ -307,7 +356,12 @@ fn builtin_collector(name: &str, params: &serde_json::Value) -> Option<Box<dyn C
         "network" => Box::new(NetworkCollector::new()),
         "uptime" => Box::new(UptimeCollector::new()),
         "self" => Box::new(SelfStatsCollector::new()),
-        "process" => Box::new(ProcessCollector::new()),
+        "process" => match params.get("names").and_then(|v| v.as_array()) {
+            Some(names) => Box::new(ProcessCollector::with_names(
+                names.iter().filter_map(|v| v.as_str()),
+            )),
+            None => Box::new(ProcessCollector::new()),
+        },
         "service" => Box::new(ServiceCollector::new(
             params
                 .get("names")
@@ -455,6 +509,69 @@ mod tests {
             1
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn log_event(line: String) -> v1::LogEvent {
+        v1::LogEvent {
+            source: "/var/log/app.log".into(),
+            line,
+            timestamp_ms: 1,
+            labels: vec![],
+        }
+    }
+
+    #[test]
+    fn log_batches_stay_under_the_server_limits() {
+        // 20 tailers x 1000 lines x 8 KiB would be ~160 MiB in one batch.
+        let mut pending: Vec<_> = (0..20_000)
+            .map(|i| log_event(format!("{i:08}{}", "x".repeat(8 * 1024 - 8))))
+            .collect();
+        let total = pending.len();
+        let ranges = chunk_logs(&pending);
+        assert!(ranges.len() > 1);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, total);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start);
+        }
+        let (cfg, buffer) = fixture("http://127.0.0.1");
+        // The 8 MiB fixture buffer drops oldest data, so append a few chunks only.
+        pending.truncate(ranges[0].len() * 2 + 10);
+        assert!(append_logs(&buffer, &mut pending, "agent"));
+        assert!(pending.is_empty());
+        let mut seen = 0;
+        let mut guard = buffer.lock().unwrap();
+        while let Some((seq, bytes)) = guard.peek().unwrap() {
+            let decoded =
+                kestrel_proto::decode_batch(&bytes, kestrel_proto::DEFAULT_MAX_DECOMPRESSED)
+                    .unwrap();
+            let raw = {
+                use prost::Message;
+                decoded.encoded_len()
+            };
+            assert!(raw < 8 * 1024 * 1024, "decoded batch is {raw} bytes");
+            assert!(decoded.logs.len() <= 10_000);
+            assert_eq!(decoded.logs[0].line[..8], format!("{seen:08}"));
+            seen += decoded.logs.len();
+            guard.ack(seq).unwrap();
+        }
+        assert_eq!(seen, ranges[0].len() * 2 + 10);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(cfg.data_dir);
+    }
+
+    #[test]
+    fn process_collector_honours_configured_names() {
+        let mut collector = builtin_collector(
+            "process",
+            &serde_json::json!({"names":["kestrel-no-such-process"]}),
+        )
+        .unwrap();
+        let samples = collector.collect(1).unwrap();
+        assert!(samples.iter().any(|s| s.name == "kestrel_process_count"
+            && s.labels
+                .contains(&("name".into(), "kestrel-no-such-process".into()))
+            && s.value == 0.0));
     }
 
     #[tokio::test]
