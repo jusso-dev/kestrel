@@ -501,6 +501,26 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
         ),
     };
     sqlx::query(&format!("UPDATE {table} SET status=$3,attempts=$4,last_error=$5,run_after=now()+make_interval(secs=>$6) WHERE tenant_id=$1 AND id=$2")).bind(tenant).bind(id).bind(status).bind(attempts).bind(error).bind(notify::backoff_seconds(attempts) as f64).execute(&mut *tx).await?;
+    if let (Some(problem), "sent") = (problem, status) {
+        if payload["event"] == "problem" {
+            // A resolve that committed while this send was in flight could not
+            // see it as sent and skipped this target. FOR SHARE waits for an
+            // in-flight resolve, so one side always queues the recovery.
+            let current: String = sqlx::query_scalar(
+                "SELECT status FROM problems WHERE tenant_id=$1 AND id=$2 FOR SHARE",
+            )
+            .bind(tenant)
+            .bind(problem)
+            .fetch_one(&mut *tx)
+            .await?;
+            if current == "resolved" {
+                let mut resolved = payload.clone();
+                resolved["event"] = json!("resolved");
+                resolved["step"] = json!(0);
+                sqlx::query("INSERT INTO notification_jobs(tenant_id,problem_id,media_type_id,status,payload,run_after) VALUES($1,$2,$3,'pending',$4,now()) ON CONFLICT DO NOTHING").bind(tenant).bind(problem).bind(media_id).bind(resolved).execute(&mut *tx).await?;
+            }
+        }
+    }
     tx.commit().await?;
     Ok(true)
 }

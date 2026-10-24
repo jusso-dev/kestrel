@@ -36,7 +36,7 @@ An email media that names its own `smtp_host` or `smtp_port` does not inherit th
 
 Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. `DELETE /api/v1/msp/grants` with `{"user_id","tenant_id"}` revokes a grant and ends that user's sessions in the tenant. Ingest is limited per tenant; the limit responds with 429.
 
-Email addresses are unique across all tenants, ignoring letter case, and sign-in matches them case-insensitively. After 10 failed sign-ins for one address within 15 minutes, further attempts for that address receive 429 until the window ends.
+Email addresses are unique across all tenants, ignoring letter case, and sign-in matches them case-insensitively. After 10 failed sign-ins for one address from one client IP within 15 minutes, further attempts for that address from that IP receive 429 until the window ends. Behind a reverse proxy every client shares the proxy's IP, so the limit then applies per address.
 
 Agent enrolment does not take over an existing host of the same name if the host has an active agent or sits outside the token's host group; enrolment then responds with 409. Revoke the old agent first.
 

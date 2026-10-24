@@ -138,9 +138,11 @@ fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     v6.to_ipv4()
 }
 
+/// Fold IPv6 forms that carry an IPv4 address (mapped, compatible, NAT64)
+/// onto that address, so denied endpoints match however they are written.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        IpAddr::V6(v6) => embedded_v4(v6).map(IpAddr::V4).unwrap_or(ip),
         ip => ip,
     }
 }
@@ -230,6 +232,10 @@ mod tests {
             .is_err());
         assert!(guard
             .apply(builder(), "http://[::ffff:127.0.0.1]:8428/")
+            .await
+            .is_err());
+        assert!(guard
+            .apply(builder(), "http://[64:ff9b::7f00:1]:8428/")
             .await
             .is_err());
         assert!(guard

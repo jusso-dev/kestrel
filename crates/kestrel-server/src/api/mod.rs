@@ -926,15 +926,23 @@ struct MetricQuery {
 
 async fn login(
     State(state): State<ApiState>,
+    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     Json(body): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
+    // Key failures on the address and the client, so nobody can lock another
+    // user out by failing logins for their address from elsewhere.
+    let throttle_key = format!(
+        "{}|{}",
+        body.email,
+        peer.map(|info| info.0.ip().to_string()).unwrap_or_default()
+    );
     if body.email.is_empty() || body.password.is_empty() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
             "email and password are required",
         ));
     }
-    if state.login_throttle.blocked(&body.email) {
+    if state.login_throttle.blocked(&throttle_key) {
         return Err(fail(
             StatusCode::TOO_MANY_REQUESTS,
             "too many failed sign-in attempts; try again later",
@@ -949,9 +957,9 @@ async fn login(
             .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))
     };
     match &result {
-        Ok(_) => state.login_throttle.succeeded(&body.email),
+        Ok(_) => state.login_throttle.succeeded(&throttle_key),
         Err(err) if err.status == StatusCode::UNAUTHORIZED => {
-            state.login_throttle.failed(&body.email)
+            state.login_throttle.failed(&throttle_key)
         }
         Err(_) => {}
     }

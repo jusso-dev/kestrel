@@ -147,8 +147,12 @@ pub async fn run_command(
     let stderr = child.stderr.take().expect("piped stderr");
     // Drain both pipes concurrently, retaining only the cap. wait_with_output
     // would buffer arbitrary plugin output in memory before truncating it.
+    // Reap the leader only after both pipes close: until then it stays a
+    // zombie, so its pid (the group id) cannot be reused before a timeout kill.
     let collected = tokio::time::timeout(timeout, async {
-        tokio::try_join!(child.wait(), read_capped(stdout), read_capped(stderr))
+        let (stdout, stderr) = tokio::try_join!(read_capped(stdout), read_capped(stderr))?;
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, stdout, stderr))
     })
     .await;
     let (status, stdout, stderr) = match collected {

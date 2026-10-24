@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
-/// Failures allowed per email address inside one window.
+/// Failures allowed per email address and client address inside one window.
 const MAX_FAILURES: u32 = 10;
 const WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Upper bound on tracked addresses so random emails cannot grow memory.

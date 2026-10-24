@@ -192,8 +192,16 @@ impl Db {
         &self,
         agent: &EnrolledAgent,
     ) -> Result<Uuid, ServerError> {
-        let existing:Option<Uuid>=sqlx::query_scalar("SELECT host_id FROM agents WHERE tenant_id=$1 AND id=$2 AND cert_serial=$3 AND revoked_at IS NULL AND host_id IS NOT NULL").bind(agent.tenant_id).bind(agent.id).bind(&agent.cert_serial).fetch_optional(&self.pool).await.map_err(db_err)?;
-        if let Some(host) = existing {
+        // An established binding survives certificate renewal and later host
+        // group moves; enrolment group rules apply only when first binding.
+        let existing: Option<(Uuid, String)> = sqlx::query_as("SELECT host_id,cert_serial FROM agents WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL AND host_id IS NOT NULL").bind(agent.tenant_id).bind(agent.id).fetch_optional(&self.pool).await.map_err(db_err)?;
+        if let Some((host, serial)) = existing {
+            if serial != agent.cert_serial {
+                let expires = DateTime::parse_from_rfc3339(&agent.cert_not_after)
+                    .map_err(|_| ServerError::new("invalid certificate expiry"))?
+                    .with_timezone(&Utc);
+                sqlx::query("UPDATE agents SET cert_serial=$3,cert_not_after=$4 WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL").bind(agent.tenant_id).bind(agent.id).bind(&agent.cert_serial).bind(expires).execute(&self.pool).await.map_err(db_err)?;
+            }
             return Ok(host);
         }
         let group = self
@@ -498,6 +506,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(names, 1);
+
+        // Renewal keeps an established binding after the host changes group.
+        let mut branch = agent(Some("branch"));
+        branch.hostname = "db".into();
+        let db_host = db.ensure_enrolled_agent(&branch).await.unwrap();
+        sqlx::query("UPDATE hosts SET host_group_id=NULL WHERE id=$1")
+            .bind(db_host)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let renewed = EnrolledAgent {
+            cert_serial: "def".into(),
+            ..branch.clone()
+        };
+        assert_eq!(db.ensure_enrolled_agent(&renewed).await.unwrap(), db_host);
+        let serial: String = sqlx::query_scalar("SELECT cert_serial FROM agents WHERE id=$1")
+            .bind(branch.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(serial, "def");
     }
 
     #[tokio::test]

@@ -248,7 +248,7 @@ async fn spawn_listener(
         let result = axum_server::bind(addr)
             .acceptor(acceptor)
             .handle(bound_handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await;
         if let Err(err) = result {
             tracing::error!(error = %err, "https listener ended");
