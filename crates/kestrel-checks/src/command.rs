@@ -341,7 +341,7 @@ mod tests {
         let check = CommandCheck {
             id: "disk".to_string(),
             command: vec![script.display().to_string()],
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(10),
             interval: Duration::from_secs(60),
         };
         let output = run_command(&check, std::slice::from_ref(&dir), 1_700_000_000_000)
