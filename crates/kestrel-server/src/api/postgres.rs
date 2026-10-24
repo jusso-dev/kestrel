@@ -81,6 +81,11 @@ fn public(mut value: Value) -> Value {
     value
 }
 
+/// A template trigger is a definition only; hosts evaluate materialised copies.
+fn template_level(trigger: &Value) -> bool {
+    !trigger["template_id"].is_null() && trigger["host_id"].is_null()
+}
+
 fn projection(kind: &str) -> &'static str {
     if kind == "host" {
         "to_jsonb(r) || jsonb_build_object('status',CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.revoked_at IS NULL AND a.last_seen_at>now()-interval '180 seconds') THEN 'up' WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.last_seen_at IS NOT NULL) THEN 'down' ELSE 'unknown' END,'last_seen_at',(SELECT max(a.last_seen_at) FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id))"
@@ -147,6 +152,9 @@ impl ApiState {
             ));
         }
         sqlx::query("INSERT INTO template_parents (tenant_id,template_id,parent_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(principal.tenant_id).bind(template).bind(parent).execute(&mut *tx).await.map_err(database_error)?;
+        crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+            .await
+            .map_err(database_error)?;
         audit(&mut tx, principal, "template.parent", &template.to_string()).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(json!({"template_id":template,"parent_id":parent}))
@@ -169,6 +177,14 @@ impl ApiState {
         values: &Value,
     ) -> Result<(), ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
+        // Host names become PromQL label values; trigger scoping rejects
+        // anything else, so such a host could never alert.
+        if kind == "host" && !values["name"].as_str().is_some_and(crate::promql::label_ok) {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "host name may only contain letters, digits, '-', '_', '.' and ':'",
+            ));
+        }
         if kind == "discovery_rule" {
             if !matches!(
                 values["entity"].as_str(),
@@ -649,6 +665,11 @@ impl ApiState {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
+        if kind == "trigger" && template_level(&row) {
+            crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,
@@ -815,6 +836,10 @@ impl ApiState {
         let db = self.db.as_ref().expect("PostgreSQL state");
         let mut tx = db.pool.begin().await.map_err(database_error)?;
         sqlx::query("INSERT INTO template_links (tenant_id,host_id,template_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(principal.tenant_id).bind(host).bind(template).execute(&mut *tx).await.map_err(database_error)?;
+        // Agentless hosts never fetch agent configuration, so materialise now.
+        crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, Some(host))
+            .await
+            .map_err(database_error)?;
         audit(&mut tx, principal, "template.link", &host.to_string()).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(json!({"host_id":host,"template_id":template}))
@@ -894,6 +919,7 @@ impl ApiState {
             .await
             .map_err(database_error)?
             .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not found"))?;
+        let was_template_level = kind == "trigger" && template_level(&values);
         if kind == "user"
             && principal.role != "owner"
             && (values["role"] == "owner" || input.get("role").is_some_and(|role| role == "owner"))
@@ -969,6 +995,11 @@ impl ApiState {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
+        if was_template_level || (kind == "trigger" && template_level(&row)) {
+            crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,
@@ -1002,6 +1033,18 @@ impl ApiState {
         let (table, _, _) = resource(kind)?;
         let db = self.db.as_ref().expect("PostgreSQL state");
         let mut tx = db.pool.begin().await.map_err(database_error)?;
+        if kind == "trigger" {
+            // Retire per-host copies; deleting the source only clears their
+            // link, and they keep problem history.
+            sqlx::query(
+                "UPDATE triggers SET enabled=false WHERE tenant_id=$1 AND source_trigger_id=$2",
+            )
+            .bind(principal.tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        }
         let sql = format!("DELETE FROM {table} WHERE tenant_id=$1 AND id=$2");
         sqlx::query(&sql)
             .bind(principal.tenant_id)

@@ -28,6 +28,7 @@ pub use maintenances::{Maintenance, NewMaintenance};
 pub use media_types::{MediaType, NewMediaType};
 pub use notification_jobs::{NewNotificationJob, NotificationJob};
 pub use problems::{NewProblem, Problem};
+pub(crate) use templates::reconcile_template_triggers;
 pub use templates::{NewTemplate, Template};
 pub use tenants::Tenant;
 pub use triggers::{NewTrigger, Trigger};

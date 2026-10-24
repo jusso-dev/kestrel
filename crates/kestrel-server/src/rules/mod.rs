@@ -12,7 +12,10 @@ use uuid::Uuid;
 
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(15);
 pub const MIN_INTERVAL_S: u32 = 15;
-pub const AGENT_UNREACHABLE_EXPR: &str = "time() - kestrel_agent_last_seen_timestamp > 180";
+/// Instant queries only look back a few minutes, so a bare gauge vanishes
+/// before the delay elapses. The range keeps a silent host firing for a day.
+pub const AGENT_UNREACHABLE_EXPR: &str =
+    "time() - max_over_time(kestrel_agent_last_seen_timestamp[24h]) > 180";
 
 #[derive(Debug, Clone)]
 pub struct TriggerDef {
