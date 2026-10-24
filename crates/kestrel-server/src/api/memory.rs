@@ -202,9 +202,13 @@ impl MemoryCatalog {
         kind: &str,
         limit: usize,
         cursor: Option<&str>,
+        status: Option<&str>,
     ) -> Value {
         let limit = limit.clamp(1, 200);
         let mut items = self.visible(principal, kind);
+        if let Some(status) = status.filter(|_| kind == "problem") {
+            items.retain(|row| row["status"] == status);
+        }
         if let Some(cursor) = cursor {
             if let Some(pos) = items
                 .iter()

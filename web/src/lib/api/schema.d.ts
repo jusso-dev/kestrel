@@ -2462,6 +2462,7 @@ export interface operations {
             query?: {
                 limit?: number;
                 cursor?: string;
+                status?: "ok" | "pending" | "problem" | "resolved";
             };
             header?: never;
             path?: never;

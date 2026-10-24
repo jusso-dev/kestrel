@@ -84,6 +84,8 @@ fn public(mut value: Value) -> Value {
 fn projection(kind: &str) -> &'static str {
     if kind == "host" {
         "to_jsonb(r) || jsonb_build_object('status',CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.revoked_at IS NULL AND a.last_seen_at>now()-interval '180 seconds') THEN 'up' WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.last_seen_at IS NOT NULL) THEN 'down' ELSE 'unknown' END,'last_seen_at',(SELECT max(a.last_seen_at) FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id))"
+    } else if kind == "problem" {
+        "to_jsonb(r) || jsonb_build_object('name',concat_ws(' on ',(SELECT t.name FROM triggers t WHERE t.tenant_id=r.tenant_id AND t.id=r.trigger_id),(SELECT h.name FROM hosts h WHERE h.tenant_id=r.tenant_id AND h.id=r.host_id)))"
     } else {
         "to_jsonb(r)"
     }
@@ -434,6 +436,7 @@ impl ApiState {
         kind: &str,
         limit: usize,
         cursor: Option<&str>,
+        status: Option<&str>,
     ) -> Result<Value, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
         if kind == "tenant" {
@@ -447,15 +450,23 @@ impl ApiState {
             .map_err(|_| fail(StatusCode::BAD_REQUEST, "invalid cursor"))?;
         let limit = limit.clamp(1, 200);
         let projection = projection(kind);
-        let sql=format!("SELECT {projection} FROM {table} r WHERE r.tenant_id=$1 AND ({scope}) AND ($2::uuid IS NULL OR TRUE) AND ($3::uuid IS NULL OR r.id > $3) ORDER BY r.id LIMIT $4");
-        let mut rows: Vec<Value> = sqlx::query_scalar(&sql)
+        // Only problems expose a status filter; other tables may lack the column.
+        let status = status.filter(|_| kind == "problem");
+        let filter = if status.is_some() {
+            " AND r.status = $5"
+        } else {
+            ""
+        };
+        let sql=format!("SELECT {projection} FROM {table} r WHERE r.tenant_id=$1 AND ({scope}) AND ($2::uuid IS NULL OR TRUE) AND ($3::uuid IS NULL OR r.id > $3){filter} ORDER BY r.id LIMIT $4");
+        let mut query = sqlx::query_scalar(&sql)
             .bind(principal.tenant_id)
             .bind(group)
             .bind(cursor)
-            .bind((limit + 1) as i64)
-            .fetch_all(&db.pool)
-            .await
-            .map_err(database_error)?;
+            .bind((limit + 1) as i64);
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        let mut rows: Vec<Value> = query.fetch_all(&db.pool).await.map_err(database_error)?;
         let next = if rows.len() > limit {
             rows[limit - 1]["id"].clone()
         } else {
@@ -757,7 +768,7 @@ impl ApiState {
 
     pub(super) async fn pg_overview(&self, principal: &Principal) -> Result<Value, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
-        let rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',t.id,'tenant_id',t.id,'name',t.name,'parent_id',t.parent_id,'problem_count',(SELECT count(*) FROM problems p WHERE p.tenant_id=t.id AND p.status='problem' AND (t.id<>u.tenant_id OR u.role IN ('owner','admin') OR u.host_group_id IS NULL OR EXISTS (SELECT 1 FROM hosts h WHERE h.tenant_id=p.tenant_id AND h.id=p.host_id AND h.host_group_id=u.host_group_id)))) FROM tenants t JOIN users u ON u.id=$1 WHERE EXISTS (SELECT 1 FROM msp_grants g WHERE g.tenant_id=t.id AND g.user_id=u.id) OR t.id=u.tenant_id ORDER BY t.name").bind(principal.user_id).fetch_all(&db.pool).await.map_err(database_error)?;
+        let rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',t.id,'tenant_id',t.id,'name',t.name,'parent_id',t.parent_id,'active',t.id=$2,'problem_count',(SELECT count(*) FROM problems p WHERE p.tenant_id=t.id AND p.status='problem' AND (t.id<>u.tenant_id OR u.role IN ('owner','admin') OR u.host_group_id IS NULL OR EXISTS (SELECT 1 FROM hosts h WHERE h.tenant_id=p.tenant_id AND h.id=p.host_id AND h.host_group_id=u.host_group_id)))) FROM tenants t JOIN users u ON u.id=$1 WHERE EXISTS (SELECT 1 FROM msp_grants g WHERE g.tenant_id=t.id AND g.user_id=u.id) OR t.id=u.tenant_id ORDER BY t.name").bind(principal.user_id).bind(principal.tenant_id).fetch_all(&db.pool).await.map_err(database_error)?;
         Ok(json!({"items":rows}))
     }
 

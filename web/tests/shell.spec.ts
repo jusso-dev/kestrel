@@ -73,16 +73,24 @@ test('SSE invalidates problems within two seconds and filters/acknowledges', asy
     (window as any).EventSource = FakeEvents;
   });
   let items: any[] = [];
-  await page.route('**/api/v1/problems?*', (route) => route.fulfill({ json: { items, next: null } }));
+  let fetches = 0;
+  await page.route('**/api/v1/problems?*', (route) => {
+    fetches += 1;
+    expect(new URL(route.request().url()).searchParams.get('status')).toBe('problem');
+    return route.fulfill({ json: { items, next: null } });
+  });
   await page.route('**/api/v1/problems/problem-1/ack', async (route) => {
-    items[0].acknowledged = true;
+    items[0].acknowledged_at = '2026-01-01T00:00:00Z';
     await route.fulfill({ json: items[0] });
   });
   await page.goto('/problems');
   await expect(page.getByText('No matching problems.')).toBeVisible();
-  items = [{ id: 'problem-1', name: 'CPU saturated', status: 'open', severity: 'high' }];
-  await page.evaluate(() => (window as any).problemEvents.dispatchEvent(new Event('problem')));
-  await expect(page.getByText('CPU saturated open high')).toBeVisible({ timeout: 2000 });
+  items = [{ id: 'problem-1', tenant_id: 'tenant-1', trigger_id: 'trigger-1', host_id: 'host-1', name: 'CPU saturated on web-1',
+    status: 'problem', severity: 'high', opened_at: '2026-01-01T00:00:00Z', resolved_at: null, acknowledged_at: null }];
+  const before = fetches;
+  await page.evaluate(() => { for (let i = 0; i < 5; i++) (window as any).problemEvents.dispatchEvent(new Event('problem')); });
+  await expect(page.getByText('CPU saturated on web-1 high')).toBeVisible({ timeout: 2000 });
+  expect(fetches - before).toBe(1);
   await page.getByLabel('Search').fill('disk');
   await expect(page.getByText('No matching problems.')).toBeVisible();
   await page.getByLabel('Search').fill('CPU');
@@ -146,7 +154,9 @@ test('dashboard widgets persist as JSON and reload', async ({ page }) => {
 
 test('tenant switching refreshes the administration overview', async ({ page }) => {
   let tenant = 'Home';
-  await page.route('**/api/v1/tenants?*', (route) => route.fulfill({ json: { items: [{ id: 'child-1', name: 'Child' }], next: null } }));
+  await page.route('**/api/v1/tenants?*', (route) => route.fulfill({ json: { items: [
+    { id: 'home-1', name: 'Home', active: tenant === 'Home' }, { id: 'child-1', name: 'Child', active: tenant === 'Child' }
+  ], next: null } }));
   await page.route('**/api/v1/msp/overview', (route) => route.fulfill({ json: { tenant } }));
   await page.route('**/api/v1/session/tenant', async (route) => {
     expect(route.request().postDataJSON()).toEqual({ tenant_id: 'child-1' });
@@ -155,7 +165,24 @@ test('tenant switching refreshes the administration overview', async ({ page }) 
   });
   await page.goto('/administration');
   await expect(page.locator('pre')).toContainText('Home');
+  await expect(page.getByLabel('Tenant')).toHaveValue('home-1');
   await page.getByLabel('Tenant').selectOption('child-1');
   await expect(page.locator('pre')).toContainText('Child');
   await expect(page.getByText('Tenant switched', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Tenant')).toHaveValue('child-1');
+  await expect(page.getByRole('option', { name: 'Child (current)' })).toBeAttached();
+});
+
+test('sign out ends the session and returns to sign in', async ({ page }) => {
+  let loggedOut = false;
+  await page.route('**/api/v1/logout', async (route) => {
+    expect(route.request().method()).toBe('POST');
+    loggedOut = true;
+    await route.fulfill({ status: 204 });
+  });
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page).toHaveURL(/\/login$/);
+  expect(loggedOut).toBe(true);
+  await expect(page.getByRole('button', { name: 'Sign out' })).toHaveCount(0);
 });

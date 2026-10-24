@@ -2,21 +2,24 @@
   import { onMount } from 'svelte';
   import { list, request } from '$lib/api/client';
 
-  let tenants: { id: string; name?: string }[] = [];
+  type Tenant = { id: string; name?: string; active?: boolean };
+  let tenants: Tenant[] = [];
+  let selected = '';
   let overview = '';
   let message = '';
 
   async function refresh() {
     try {
-      tenants = await list<{ id: string; name?: string }>('/tenants');
+      tenants = await list<Tenant>('/tenants');
+      selected = tenants.find((tenant) => tenant.active)?.id ?? '';
       try { overview = JSON.stringify(await request('/msp/overview')); }
       catch { overview = 'MSP overview is limited to owners and admins.'; }
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Unable to load administration.'; }
   }
   onMount(() => { void refresh(); });
 
-  async function switchTenant(event: Event) {
-    const tenantId = (event.currentTarget as HTMLSelectElement).value;
+  async function switchTenant() {
+    const tenantId = selected;
     if (!tenantId) return;
     try {
       const response = await fetch('/api/v1/session/tenant', {
@@ -25,18 +28,19 @@
       body: JSON.stringify({ tenant_id: tenantId })
     });
       message = response.ok ? 'Tenant switched' : 'Switch refused. An MSP grant is required.';
-      if (response.ok) await refresh();
     } catch { message = 'Unable to reach the server.'; }
+    // Reload either way so the select reflects the session's actual tenant.
+    await refresh();
   }
 </script>
 
 <h1 class="text-2xl">Administration</h1>
 <p class="mt-2 text-[var(--muted)]">Users, tokens, media types and MSP grants. A grant is required before an operator can switch tenant.</p>
 <label class="mt-4 block text-sm">Tenant
-  <select class="mt-1 block border border-[var(--line)] bg-transparent px-2 py-1" on:change={switchTenant}>
+  <select class="mt-1 block border border-[var(--line)] bg-transparent px-2 py-1" bind:value={selected} on:change={switchTenant}>
     <option value="">Choose a tenant</option>
     {#each tenants as tenant}
-      <option value={tenant.id}>{tenant.name ?? tenant.id}</option>
+      <option value={tenant.id}>{tenant.name ?? tenant.id}{tenant.active ? ' (current)' : ''}</option>
     {/each}
   </select>
 </label>

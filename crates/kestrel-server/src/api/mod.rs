@@ -767,6 +767,9 @@ pub fn openapi_value() -> Value {
             } else if spec.operation.starts_with("list_") {
                 parameters.push(json!({"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200}}));
                 parameters.push(json!({"name":"cursor","in":"query","schema":{"type":"string","format":"uuid"}}));
+                if spec.operation == "list_problems" {
+                    parameters.push(json!({"name":"status","in":"query","schema":{"type":"string","enum":["ok","pending","problem","resolved"]}}));
+                }
             }
             for parameter in &mut parameters {
                 if parameter.get("required").is_none() {
@@ -879,6 +882,7 @@ fn ensure(principal: &Principal, permission: Permission) -> Result<(), ApiError>
 struct Page {
     limit: Option<usize>,
     cursor: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1423,6 +1427,7 @@ async fn list_kind(
                 kind,
                 page.limit.unwrap_or(50),
                 page.cursor.as_deref(),
+                page.status.as_deref(),
             )
             .await
             .map(Json);
@@ -1432,6 +1437,7 @@ async fn list_kind(
         kind,
         page.limit.unwrap_or(50),
         page.cursor.as_deref(),
+        page.status.as_deref(),
     )))
 }
 
