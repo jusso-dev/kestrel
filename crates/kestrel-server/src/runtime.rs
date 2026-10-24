@@ -440,11 +440,15 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
             match kind.as_str() {
                 "wedgetail" => {
                     WedgetailForwarder::new(required(&config, "url")?, required(&config, "token")?)
+                        .with_egress(&state.egress)
+                        .await?
                         .forward(&event)
                         .await?
                 }
                 "siem_webhook" => {
                     WebhookForwarder::new(required(&config, "url")?, required(&config, "secret")?)
+                        .with_egress(&state.egress)
+                        .await?
                         .forward(&event)
                         .await?
                 }
@@ -480,7 +484,9 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
                 )
                 .await??
             } else {
-                notify::HttpNotifier::new().send(&rendered, &config).await?
+                notify::HttpNotifier::guarded(state.egress.clone())
+                    .send(&rendered, &config)
+                    .await?
             }
         }
         Ok(())
@@ -613,7 +619,9 @@ mod tests {
             sqlx::query("INSERT INTO media_types(id,tenant_id,name,kind,config) VALUES($1,$2,'later','webhook',$3)").bind(later).bind(tenant).bind(json!({"url":hook.uri(),"secret":"local-test"})).execute(&db.pool).await?;
             sqlx::query("INSERT INTO action_steps(tenant_id,action_id,step,delay_s,media_type_ids) SELECT tenant_id,id,1,3600,$2 FROM actions WHERE tenant_id=$1").bind(tenant).bind(json!([later])).execute(&db.pool).await?;
             let signal=Arc::new(Signal{firing:AtomicBool::new(true),tenant,include_host:AtomicBool::new(true),value:AtomicU64::new(95)});
-            let state=ApiState::new(Arc::new(crate::api::MemoryCatalog::new()),signal.clone()).with_database(db.clone(),Arc::new(crate::secrets::SecretBox::load_or_create(&std::env::temp_dir().join(format!("{name}.key")))?));
+            let mut state=ApiState::new(Arc::new(crate::api::MemoryCatalog::new()),signal.clone()).with_database(db.clone(),Arc::new(crate::secrets::SecretBox::load_or_create(&std::env::temp_dir().join(format!("{name}.key")))?));
+            // The webhook fake listens on loopback, which the default policy refuses.
+            state.egress=Arc::new(kestrel_checks::EgressGuard::new(true));
             evaluate(&state).await?;
             let problem:Uuid=sqlx::query_scalar("SELECT id FROM problems WHERE tenant_id=$1").bind(tenant).fetch_one(&db.pool).await?;
             assert!(deliver_one(&state,"https://monitor.example",false).await?);

@@ -23,6 +23,7 @@ pub use api_tokens::{ApiToken, NewApiToken};
 pub use audit::{AuditEntry, NewAuditEntry};
 pub use host_groups::{HostGroup, NewHostGroup};
 pub use hosts::{Host, HostFilter, NewHost};
+pub(crate) use ingest_runtime::HOST_CONFLICT;
 pub use items::{Item, NewItem};
 pub use maintenances::{Maintenance, NewMaintenance};
 pub use media_types::{MediaType, NewMediaType};

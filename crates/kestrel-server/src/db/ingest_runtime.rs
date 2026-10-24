@@ -7,6 +7,55 @@ use crate::{
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+/// Prefix of enrolment errors that map to HTTP 409.
+pub(crate) const HOST_CONFLICT: &str = "enrolment host conflict";
+
+/// The existing host named `hostname`, if `agent` may bind to it.
+///
+/// Host names are unique per tenant, so a name that is already taken can only
+/// be bound when the host sits in the token's group (if it has one) and no
+/// other agent is active on it. Otherwise enrolment is refused rather than
+/// taking over another host's identity.
+async fn bindable_host(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    hostname: &str,
+    group: Option<Uuid>,
+    agent: Uuid,
+) -> Result<Option<Uuid>, ServerError> {
+    let existing: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id,host_group_id FROM hosts WHERE tenant_id=$1 AND name=$2 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(hostname)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    let Some((host, host_group)) = existing else {
+        return Ok(None);
+    };
+    if group.is_some() && host_group != group {
+        return Err(ServerError::new(format!(
+            "{HOST_CONFLICT}: host {hostname} is outside the token's host group"
+        )));
+    }
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE tenant_id=$1 AND host_id=$2 AND id<>$3 AND revoked_at IS NULL)",
+    )
+    .bind(tenant)
+    .bind(host)
+    .bind(agent)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    if active {
+        return Err(ServerError::new(format!(
+            "{HOST_CONFLICT}: host {hostname} already has an active agent; revoke it first"
+        )));
+    }
+    Ok(Some(host))
+}
+
 impl Db {
     async fn apply_inventory(
         &self,
@@ -103,6 +152,40 @@ impl Db {
         }
         Ok(())
     }
+    /// Resolve an enrolment token's host group, given by id or name.
+    async fn enrolment_group(
+        &self,
+        tenant: Uuid,
+        group: Option<&str>,
+    ) -> Result<Option<Uuid>, ServerError> {
+        let Some(value) = group else {
+            return Ok(None);
+        };
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM host_groups WHERE tenant_id=$1 AND (id::text=$2 OR name=$2)",
+        )
+        .bind(tenant)
+        .bind(value)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| ServerError::new("unknown enrolment host group"))
+        .map(Some)
+    }
+
+    /// Refuse an enrolment that would take over an existing host it may not bind.
+    pub(crate) async fn check_enrolment_host(
+        &self,
+        tenant: Uuid,
+        hostname: &str,
+        group: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let group = self.enrolment_group(tenant, group).await?;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        bindable_host(&mut tx, tenant, hostname, group, Uuid::nil()).await?;
+        Ok(())
+    }
+
     /// Reconcile the durable certificate directory with the SQL host inventory.
     /// Repeated calls retain host identity and sequence acknowledgement.
     pub(crate) async fn ensure_enrolled_agent(
@@ -113,20 +196,9 @@ impl Db {
         if let Some(host) = existing {
             return Ok(host);
         }
-        let group = match &agent.host_group_id {
-            Some(value) => Some(
-                sqlx::query_scalar::<_, Uuid>(
-                    "SELECT id FROM host_groups WHERE tenant_id=$1 AND (id::text=$2 OR name=$2)",
-                )
-                .bind(agent.tenant_id)
-                .bind(value)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?
-                .ok_or_else(|| ServerError::new("unknown enrolment host group"))?,
-            ),
-            None => None,
-        };
+        let group = self
+            .enrolment_group(agent.tenant_id, agent.host_group_id.as_deref())
+            .await?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let quota: i32 =
             sqlx::query_scalar("SELECT host_quota FROM tenants WHERE id=$1 FOR UPDATE")
@@ -134,13 +206,8 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        let existing: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM hosts WHERE tenant_id=$1 AND name=$2")
-                .bind(agent.tenant_id)
-                .bind(&agent.hostname)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        let existing =
+            bindable_host(&mut tx, agent.tenant_id, &agent.hostname, group, agent.id).await?;
         let host = if let Some(host) = existing {
             host
         } else {
@@ -375,6 +442,62 @@ mod tests {
         ) -> Result<Vec<Series>, ServerError> {
             self.store.query_range(query, start, end, step).await
         }
+    }
+
+    #[tokio::test]
+    async fn enrolment_does_not_take_over_hosts_outside_group_or_with_active_agents() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let db = Db::connect(&url).await.unwrap();
+        let tenant = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+            .bind(tenant)
+            .bind(format!("enrol-{tenant}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO host_groups (tenant_id,name) VALUES ($1,'branch')")
+            .bind(tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let agent = |group: Option<&str>| EnrolledAgent {
+            id: Uuid::new_v4(),
+            tenant_id: tenant,
+            hostname: "web".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cert_serial: "abc".into(),
+            cert_not_after: "2030-01-01T00:00:00Z".into(),
+            host_group_id: group.map(str::to_string),
+        };
+        let first = agent(None);
+        let host = db.ensure_enrolled_agent(&first).await.unwrap();
+        let second = agent(None);
+        let err = db.ensure_enrolled_agent(&second).await.unwrap_err();
+        assert!(err.to_string().starts_with(HOST_CONFLICT), "{err}");
+        assert!(db.check_enrolment_host(tenant, "web", None).await.is_err());
+        sqlx::query("UPDATE agents SET revoked_at=now() WHERE id=$1")
+            .bind(first.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let grouped = agent(Some("branch"));
+        let err = db.ensure_enrolled_agent(&grouped).await.unwrap_err();
+        assert!(err.to_string().contains("host group"), "{err}");
+        assert!(db
+            .check_enrolment_host(tenant, "web", Some("branch"))
+            .await
+            .is_err());
+        db.check_enrolment_host(tenant, "web", None).await.unwrap();
+        assert_eq!(db.ensure_enrolled_agent(&second).await.unwrap(), host);
+        let names: i64 = sqlx::query_scalar("SELECT count(*) FROM hosts WHERE tenant_id=$1")
+            .bind(tenant)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(names, 1);
     }
 
     #[tokio::test]

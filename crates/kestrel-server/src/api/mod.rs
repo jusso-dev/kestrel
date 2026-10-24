@@ -7,6 +7,7 @@ mod memory;
 mod postgres;
 #[cfg(test)]
 mod postgres_tests;
+mod throttle;
 
 pub use memory::{session_cookie, MemoryCatalog, Principal};
 
@@ -573,6 +574,13 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         location: Location::Api,
     },
     RouteSpec {
+        method: "DELETE",
+        path: "/api/v1/msp/grants",
+        operation: "delete_grant",
+        auth: AuthKind::User(Permission::TenantAdmin),
+        location: Location::Api,
+    },
+    RouteSpec {
         method: "POST",
         path: "/v1/metrics",
         operation: "otlp_metrics",
@@ -600,6 +608,9 @@ pub struct ApiState {
     pub(crate) quotas: Arc<crate::quota::Quotas>,
     pub(crate) directory: Option<Arc<crate::store::Directory>>,
     pub(crate) smtp: Option<crate::config::SmtpConfig>,
+    /// Outbound policy for tenant-supplied URLs (checks, scrapes, webhooks).
+    pub egress: Arc<kestrel_checks::EgressGuard>,
+    pub(crate) login_throttle: Arc<throttle::LoginThrottle>,
 }
 
 impl ApiState {
@@ -625,6 +636,8 @@ impl ApiState {
             quotas: Arc::new(crate::quota::Quotas::per_second(50_000)),
             directory: None,
             smtp: None,
+            egress: Arc::new(kestrel_checks::EgressGuard::new(false)),
+            login_throttle: Arc::default(),
         }
     }
 }
@@ -737,6 +750,7 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "switch_tenant" => post(switch_tenant),
         "msp_overview" => get(msp_overview),
         "create_grant" => post(create_grant),
+        "delete_grant" => axum::routing::delete(delete_grant),
         "otlp_metrics" => post(otlp_metrics),
         other => panic!("route {other} has no handler"),
     }
@@ -777,7 +791,7 @@ pub fn openapi_value() -> Value {
                 }
             }
             operation["parameters"] = json!(parameters);
-            if spec.method == "POST" || spec.method == "PUT" {
+            if spec.method == "POST" || spec.method == "PUT" || spec.operation == "delete_grant" {
                 let schema = if spec.operation == "login" {
                     json!({"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string","format":"password"}}})
                 } else {
@@ -920,14 +934,28 @@ async fn login(
             "email and password are required",
         ));
     }
-    let secret = if state.db.is_some() {
-        state.pg_login(&body.email, &body.password).await?
+    if state.login_throttle.blocked(&body.email) {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed sign-in attempts; try again later",
+        ));
+    }
+    let result = if state.db.is_some() {
+        state.pg_login(&body.email, &body.password).await
     } else {
         state
             .catalog
             .login(&body.email, &body.password)
-            .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))?
+            .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))
     };
+    match &result {
+        Ok(_) => state.login_throttle.succeeded(&body.email),
+        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
+            state.login_throttle.failed(&body.email)
+        }
+        Err(_) => {}
+    }
+    let secret = result?;
     let cookie = session_cookie(&secret, state.secure_cookie);
     let mut response = Json(json!({ "email": body.email })).into_response();
     response.headers_mut().insert(
@@ -1547,7 +1575,7 @@ async fn test_media(
         let result = if target["kind"] == "email" {
             crate::notify::send_smtp(&rendered, &target).await
         } else {
-            crate::notify::HttpNotifier::new()
+            crate::notify::HttpNotifier::guarded(state.egress.clone())
                 .send(&rendered, &target)
                 .await
         };
@@ -1564,7 +1592,7 @@ async fn test_media(
         .and_then(Value::as_str)
         .unwrap_or("memory://local");
     if !url.starts_with("memory://") {
-        let notifier = crate::notify::HttpNotifier::new();
+        let notifier = crate::notify::HttpNotifier::guarded(state.egress.clone());
         let rendered = crate::notify::render("test", "kestrel", "media", "1", url, "problem")
             .map_err(|err| fail(StatusCode::BAD_GATEWAY, err.to_string()))?;
         let target = json!({ "kind": media.get("kind").and_then(Value::as_str).unwrap_or("webhook"), "url": url, "webhook_url": url, "secret": media.get("secret").and_then(Value::as_str).unwrap_or("") });
@@ -1895,6 +1923,32 @@ async fn create_grant(
         )
         .map(Json)
         .map_err(|err| fail(StatusCode::BAD_REQUEST, err))
+}
+
+async fn delete_grant(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    let user_id = body
+        .get("user_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "user_id is required"))?;
+    let tenant_id = body
+        .get("tenant_id")
+        .and_then(Value::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "tenant_id is required"))?;
+    if state.db.is_some() {
+        state
+            .pg_revoke_grant(&principal, user_id, tenant_id)
+            .await?;
+    } else {
+        state.catalog.remove_grant(user_id, tenant_id);
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn otlp_metrics(

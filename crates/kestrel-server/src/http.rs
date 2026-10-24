@@ -148,6 +148,7 @@ pub async fn start_with(
     api_state.directory = Some(Arc::clone(&store));
     api_state.smtp = cfg.smtp.clone();
     api_state.otlp_drop = cfg.otlp_drop_attributes.clone();
+    api_state.egress = Arc::new(egress_guard(&cfg));
     api_state.quotas = Arc::clone(&quotas);
     api_state.db = db.clone();
     api_state.secrets = Some(Arc::new(crate::secrets::SecretBox::load_or_create(
@@ -217,6 +218,24 @@ async fn bound_ingest(State(state): State<AppState>, request: Request, next: Nex
     next.run(request).await
 }
 
+/// Refuse tenant-supplied URLs that reach the shared metric store or this
+/// server's own bound listeners.
+fn egress_guard(cfg: &ServerConfigFile) -> kestrel_checks::EgressGuard {
+    let mut guard = kestrel_checks::EgressGuard::new(cfg.allow_loopback_targets);
+    if let (Some(host), Some(port)) = (
+        cfg.victoria_url.host_str(),
+        cfg.victoria_url.port_or_known_default(),
+    ) {
+        guard = guard.deny_endpoint(host, port);
+    }
+    for addr in [Some(cfg.listen), cfg.ingest_listen].into_iter().flatten() {
+        if !addr.ip().is_unspecified() {
+            guard = guard.deny_endpoint(&addr.ip().to_string(), addr.port());
+        }
+    }
+    guard
+}
+
 async fn spawn_listener(
     addr: SocketAddr,
     config: axum_server::tls_rustls::RustlsConfig,
@@ -251,9 +270,31 @@ async fn enrol(
             "token, csr_pem, and hostname are required",
         ));
     }
-    if let Err(err) = state.store.check_token(&body.token) {
-        tracing::info!(error = %err, "enrolment rejected");
-        return Err(token_response(err));
+    let (tenant_id, group) = match state.store.token_scope(&body.token) {
+        Ok(scope) => scope,
+        Err(err) => {
+            tracing::info!(error = %err, "enrolment rejected");
+            return Err(token_response(err));
+        }
+    };
+    if let Some(db) = &state.db {
+        if let Err(err) = db
+            .check_enrolment_host(tenant_id, &body.hostname, group.as_deref())
+            .await
+        {
+            tracing::info!(error = %err, "enrolment rejected");
+            let message = err.to_string();
+            return Err(if message.starts_with(crate::db::HOST_CONFLICT) {
+                reject(axum::http::StatusCode::CONFLICT, message)
+            } else if message == "unknown enrolment host group" {
+                reject(axum::http::StatusCode::BAD_REQUEST, message)
+            } else {
+                reject(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "enrolment store failed",
+                )
+            });
+        }
     }
     let agent_id = Uuid::new_v4();
     let issued = sign_agent(&state, &body.csr_pem, agent_id).await?;

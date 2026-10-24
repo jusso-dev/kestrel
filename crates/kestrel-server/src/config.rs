@@ -93,6 +93,10 @@ pub struct ServerConfigFile {
     pub log_retention_days: u32,
     #[serde(default = "default_otlp_drop_attributes")]
     pub otlp_drop_attributes: Vec<String>,
+    /// Let tenant-configured HTTP checks, scrapes and webhooks reach loopback.
+    /// Off by default; see `docs/operations.md`.
+    #[serde(default)]
+    pub allow_loopback_targets: bool,
 }
 
 fn default_log_retention_days() -> u32 {

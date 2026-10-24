@@ -40,6 +40,7 @@ fn server_config(dir: &Path) -> ServerConfigFile {
         data_dir: dir.join("data"),
         log_retention_days: 7,
         otlp_drop_attributes: vec!["user_id".to_string()],
+        allow_loopback_targets: false,
     }
 }
 

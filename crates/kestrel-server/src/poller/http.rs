@@ -86,12 +86,13 @@ pub(crate) fn spawn(state: ApiState) -> JoinHandle<()> {
                 }
                 let store = state.store.clone();
                 let permits = permits.clone();
+                let egress = state.egress.clone();
                 let task=tasks.spawn(async move {
                     let mut interval=tokio::time::interval(job.interval);interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
                         interval.tick().await;
                         let Ok(_permit)=permits.acquire().await else{return;};
-                        match collect(&job).await {
+                        match collect(&job, &egress).await {
                             Ok(samples)=>{if let Err(err)=store.write(samples).await {tracing::warn!(host=%job.host,error=%err,"HTTP poller could not store samples");}},
                             Err(_)=>tracing::warn!(host=%job.host,item=%job.key,"HTTP or Prometheus poll failed"),
                         }
@@ -125,7 +126,10 @@ async fn load(db: &crate::db::Db) -> Result<Vec<Job>, Error> {
         .collect())
 }
 
-async fn collect(job: &Job) -> Result<Vec<LabelledSample>, Error> {
+async fn collect(
+    job: &Job,
+    egress: &Arc<kestrel_checks::EgressGuard>,
+) -> Result<Vec<LabelledSample>, Error> {
     let url = job.params["url"].as_str().ok_or("missing HTTP URL")?;
     let timeout = Duration::from_secs(job.params["timeout_s"].as_u64().unwrap_or(10).clamp(1, 300));
     let now = SystemTime::now()
@@ -139,7 +143,9 @@ async fn collect(job: &Job) -> Result<Vec<LabelledSample>, Error> {
             timeout,
             body_regex: job.params["body_regex"].as_str().map(str::to_string),
         };
-        let mut samples = kestrel_checks::run_http_check(&check, now).await.samples;
+        let mut samples = kestrel_checks::run_http_check_guarded(&check, now, Some(egress))
+            .await
+            .samples;
         if let Some(name) = job.params["job"].as_str() {
             for sample in &mut samples {
                 sample.labels.push(("job".into(), name.into()));
@@ -147,12 +153,13 @@ async fn collect(job: &Job) -> Result<Vec<LabelledSample>, Error> {
         }
         samples
     } else {
-        kestrel_checks::scrape_prometheus(
+        kestrel_checks::scrape_prometheus_guarded(
             url,
             job.params["job"].as_str().unwrap_or(&job.key),
             job.params["instance"].as_str().unwrap_or(""),
             timeout,
             now,
+            Some(egress),
         )
         .await?
     };
@@ -209,13 +216,14 @@ mod tests {
             interval: Duration::from_secs(30),
             params: serde_json::json!({"url":format!("{}/failed",server.uri())}),
         };
-        let samples = collect(&job).await.unwrap();
+        let loopback = Arc::new(kestrel_checks::EgressGuard::new(true));
+        let samples = collect(&job, &loopback).await.unwrap();
         assert!(samples
             .iter()
             .any(|s| s.name == "kestrel_http_up" && s.value == 0.0));
         job.kind = "prometheus".into();
         job.params = serde_json::json!({"url":format!("{}/metrics",server.uri()),"job":"node"});
-        let samples = collect(&job).await.unwrap();
+        let samples = collect(&job, &loopback).await.unwrap();
         assert_eq!(samples[0].value, 123.0);
         assert_eq!(
             samples[0]
@@ -228,5 +236,12 @@ mod tests {
         assert!(samples[0]
             .labels
             .contains(&("tenant".into(), job.tenant.to_string())));
+        // The default policy refuses loopback, so the same scrape fails.
+        let strict = Arc::new(kestrel_checks::EgressGuard::new(false));
+        assert!(collect(&job, &strict).await.is_err());
+        let port = server.address().port();
+        let store =
+            Arc::new(kestrel_checks::EgressGuard::new(true).deny_endpoint("127.0.0.1", port));
+        assert!(collect(&job, &store).await.is_err());
     }
 }

@@ -44,6 +44,12 @@ impl ForwardError {
     }
 }
 
+fn forward_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
 pub struct WebhookForwarder {
     client: reqwest::Client,
     url: String,
@@ -53,14 +59,26 @@ pub struct WebhookForwarder {
 impl WebhookForwarder {
     pub fn new(url: impl Into<String>, secret: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+            client: forward_builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             url: url.into(),
             secret: secret.into(),
         }
+    }
+
+    /// Restrict connections to the configured URL with `egress`.
+    pub async fn with_egress(
+        mut self,
+        egress: &std::sync::Arc<kestrel_checks::EgressGuard>,
+    ) -> Result<Self, ForwardError> {
+        self.client = egress
+            .apply(forward_builder(), &self.url)
+            .await
+            .map_err(ForwardError::new)?
+            .build()
+            .map_err(|err| ForwardError::new(err.to_string()))?;
+        Ok(self)
     }
 }
 
@@ -99,14 +117,26 @@ pub struct WedgetailForwarder {
 impl WedgetailForwarder {
     pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+            client: forward_builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             url: url.into(),
             token: token.into(),
         }
+    }
+
+    /// Restrict connections to the configured URL with `egress`.
+    pub async fn with_egress(
+        mut self,
+        egress: &std::sync::Arc<kestrel_checks::EgressGuard>,
+    ) -> Result<Self, ForwardError> {
+        self.client = egress
+            .apply(forward_builder(), &self.url)
+            .await
+            .map_err(ForwardError::new)?
+            .build()
+            .map_err(|err| ForwardError::new(err.to_string()))?;
+        Ok(self)
     }
 }
 

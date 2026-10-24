@@ -41,7 +41,7 @@ async fn main() -> Result<(), Error> {
         // intentional default 50k/s admission limit. Restore is unnecessary:
         // the entire isolated database is removed below.
         sqlx::query("UPDATE tenants SET samples_per_second=10000000").execute(&pool).await?;
-        let cfg=ServerConfigFile{listen:"127.0.0.1:0".parse()?,ingest_listen:None,database_url:String::new(),victoria_url:victoria.clone(),tls:TlsConfig{cert_path:dir.join("server.crt"),key_path:dir.join("server.key")},ca:CaConfig{cert_path:dir.join("ca.crt"),key_path:dir.join("ca.key")},public_url:Url::parse("https://127.0.0.1")?,smtp:None,data_dir:dir.join("server"),log_retention_days:7,otlp_drop_attributes:vec!["user_id".into()]};
+        let cfg=ServerConfigFile{listen:"127.0.0.1:0".parse()?,ingest_listen:None,database_url:String::new(),victoria_url:victoria.clone(),tls:TlsConfig{cert_path:dir.join("server.crt"),key_path:dir.join("server.key")},ca:CaConfig{cert_path:dir.join("ca.crt"),key_path:dir.join("ca.key")},public_url:Url::parse("https://127.0.0.1")?,smtp:None,data_dir:dir.join("server"),log_retention_days:7,otlp_drop_attributes:vec!["user_id".into()],allow_loopback_targets:false};
         let server=kestrel_server::start_with(cfg,Some(db.clone())).await?;
         let server_url=Url::parse(&format!("https://{}/",server.addr))?;
         let concurrency=32u64;let batches=100u64;let batch_size=1000u64;
