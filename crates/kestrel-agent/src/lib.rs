@@ -173,7 +173,7 @@ async fn serve(
     });
 
     tokio::select! {
-        result = tokio::signal::ctrl_c() => result?,
+        result = shutdown_signal() => result?,
         _ = requested_stop(&mut stop) => {},
     }
     let _ = shutdown_tx.send(true);
@@ -192,6 +192,22 @@ async fn serve(
     let mut guard = buffer.lock().unwrap_or_else(|err| err.into_inner());
     guard.sync()?;
     Ok(())
+}
+
+/// Wait for Ctrl-C, or SIGTERM on Unix (sent by systemd and launchd on stop).
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 async fn requested_stop(stop: &mut Option<watch::Receiver<bool>>) {
