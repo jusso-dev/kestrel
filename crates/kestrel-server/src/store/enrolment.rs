@@ -157,10 +157,15 @@ impl Directory {
         Ok(token)
     }
 
-    pub fn check_token(&self, token: &str) -> Result<(), ServerError> {
+    /// Validate `token` and return its tenant and host group.
+    pub fn token_scope(&self, token: &str) -> Result<(Uuid, Option<String>), ServerError> {
         self.with_ref(|state| {
             let index = find_token(&state.tokens, token).ok_or_else(token_rejected)?;
-            validate_token(&state.tokens[index])
+            validate_token(&state.tokens[index])?;
+            Ok((
+                state.tokens[index].tenant_id,
+                state.tokens[index].host_group_id.clone(),
+            ))
         })
     }
 
@@ -496,7 +501,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.join("enrolment.json")).unwrap();
         assert!(!text.contains(&token));
         assert!(text.contains("linux"));
-        store.check_token(&token).unwrap();
+        store.token_scope(&token).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -505,7 +510,7 @@ mod tests {
         let dir = scratch("expired");
         let store = Directory::open(&dir).unwrap();
         let token = store.create_token(None, Duration::ZERO).unwrap();
-        let err = store.check_token(&token).unwrap_err();
+        let err = store.token_scope(&token).unwrap_err();
         assert_eq!(err.to_string(), TOKEN_REJECTED);
         let _ = std::fs::remove_dir_all(&dir);
     }

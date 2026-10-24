@@ -128,6 +128,12 @@ impl MemoryCatalog {
         self.lock().grants.push(Grant { user_id, tenant_id });
     }
 
+    pub fn remove_grant(&self, user_id: Uuid, tenant_id: Uuid) {
+        self.lock()
+            .grants
+            .retain(|grant| grant.user_id != user_id || grant.tenant_id != tenant_id);
+    }
+
     pub fn login(&self, email: &str, password: &str) -> Result<String, Rejected> {
         let mut inner = self.lock();
         let found = inner

@@ -24,9 +24,21 @@ An action has steps with a delay. A later step is skipped once the problem is ac
 
 SIEM delivery is outbound only, to URLs an operator saved. Syslog uses TLS and RFC 5425 octet-counted frames. See [integrations/wedgetail.md](integrations/wedgetail.md).
 
+## Outbound requests
+
+Server-side HTTP checks, Prometheus scrapes, webhook, Slack, Teams and PagerDuty media, media tests and SIEM webhooks fetch URLs that tenant administrators supply. Before connecting, the server resolves the host and refuses loopback, link-local (including cloud metadata such as `169.254.169.254`), unspecified, multicast and broadcast addresses, IPv4-mapped forms of these, the configured `victoria_url` host and port, and the server's own listen addresses when they are bound to a specific IP. The check applies to the address actually connected, so DNS rebinding does not bypass it. Private ranges (RFC 1918 and IPv6 ULA) remain allowed. Redirects are not followed and proxy environment variables are ignored for these requests.
+
+To let these requests reach loopback, for example an exporter on the server host itself, set `allow_loopback_targets = true` (or `KESTREL_ALLOW_LOOPBACK_TARGETS=true`). The metric store stays refused either way. Leave it off on multi-tenant servers.
+
+An email media that names its own `smtp_host` or `smtp_port` does not inherit the server's SMTP username and password.
+
 ## Tenants
 
-Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429.
+Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. `DELETE /api/v1/msp/grants` with `{"user_id","tenant_id"}` revokes a grant and ends that user's sessions in the tenant. Ingest is limited per tenant; the limit responds with 429.
+
+Email addresses are unique across all tenants, ignoring letter case, and sign-in matches them case-insensitively. After 10 failed sign-ins for one address within 15 minutes, further attempts for that address receive 429 until the window ends.
+
+Agent enrolment does not take over an existing host of the same name if the host has an active agent or sits outside the token's host group; enrolment then responds with 409. Revoke the old agent first.
 
 ## Roles
 
@@ -42,7 +54,7 @@ Restore into an isolated environment first, using the same application version. 
 
 ## Upgrade
 
-Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
+Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0011 requires PostgreSQL 15 or later and stops with an error if two users share an email address (across tenants or by letter case); rename those users before upgrading. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
 
 Do not start an older binary against a migrated database unless its release explicitly supports that schema. To roll back an incompatible migration, stop the new server and restore the matching application, database and data-directory backup. Notification and SIEM delivery are at least once: a crash after remote acceptance but before transaction commit may redeliver a job. Receivers should deduplicate by problem or event identifier.
 

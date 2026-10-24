@@ -309,3 +309,145 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn api_postgres_users_have_global_emails_delete_cleanly_and_grants_revoke() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let parent = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for id in [parent, other] {
+        sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+            .bind(id)
+            .bind(format!("identity-test-{id}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let email = format!("owner-{parent}@example.test");
+    let owner = db
+        .insert_user(
+            &crate::db::TenantId(parent),
+            crate::db::NewUser {
+                email: email.clone(),
+                password_hash: crate::passwords::hash_password("password-test").unwrap(),
+                role: "owner".into(),
+                host_group_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let principal = Principal {
+        user_id: owner.id,
+        tenant_id: parent,
+        email: email.clone(),
+        role: "owner".into(),
+        host_group_id: None,
+    };
+    let other_principal = Principal {
+        tenant_id: other,
+        user_id: Uuid::new_v4(),
+        ..principal.clone()
+    };
+    let dir = std::env::temp_dir().join(format!("kestrel-api-identity-{parent}"));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+
+    // Another tenant cannot claim the same address, in any letter case.
+    let err = state
+        .pg_insert(
+            &other_principal,
+            "user",
+            json!({"email":email.to_uppercase(),"password":"password-test","role":"viewer"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    state
+        .pg_login(&email.to_uppercase(), "password-test")
+        .await
+        .unwrap();
+
+    // A user who has signed in (session and audit rows) can be deleted.
+    let member_email = format!("member-{parent}@example.test");
+    let member = state
+        .pg_insert(
+            &principal,
+            "user",
+            json!({"email":member_email,"password":"password-test","role":"admin"}),
+        )
+        .await
+        .unwrap();
+    let member_id = Uuid::parse_str(member["id"].as_str().unwrap()).unwrap();
+    state
+        .pg_login(&member_email, "password-test")
+        .await
+        .unwrap();
+    let member_principal = Principal {
+        user_id: member_id,
+        role: "admin".into(),
+        ..principal.clone()
+    };
+    state
+        .pg_insert(&member_principal, "token", json!({"name":"member"}))
+        .await
+        .unwrap();
+    state
+        .pg_delete(&principal, "user", member_id)
+        .await
+        .unwrap();
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND user_id IS NULL")
+            .bind(parent)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(audits >= 1, "audit history must survive user deletion");
+
+    // Revoking a grant ends sessions that were switched into the child.
+    let child = state
+        .pg_create_tenant(
+            &principal,
+            json!({"name":format!("identity-child-{parent}")}),
+        )
+        .await
+        .unwrap();
+    let child_id = Uuid::parse_str(child["id"].as_str().unwrap()).unwrap();
+    let session = state.pg_login(&email, "password-test").await.unwrap();
+    state
+        .pg_switch(&principal, &session, child_id)
+        .await
+        .unwrap();
+    assert!(state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .is_some());
+    let err = state
+        .pg_revoke_grant(&other_principal, owner.id, child_id)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    state
+        .pg_revoke_grant(&principal, owner.id, child_id)
+        .await
+        .unwrap();
+    assert!(state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .is_none());
+    let err = state
+        .pg_revoke_grant(&principal, owner.id, child_id)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -2,7 +2,7 @@
 //! resource map; all request values are bound parameters.
 
 use super::{fail, ApiError, ApiState, Principal};
-use crate::passwords::{hash_password, random_token, token_hash, verify_password};
+use crate::passwords::{hash_password, random_token, token_hash};
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 fn database_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(ref database) = error {
+        if database.constraint() == Some("users_email_lower_key") {
+            return fail(StatusCode::CONFLICT, "email address is already in use");
+        }
         if database.is_unique_violation() {
             return fail(StatusCode::CONFLICT, "resource already exists");
         }
@@ -369,17 +372,20 @@ impl ApiState {
 
     pub(super) async fn pg_login(&self, email: &str, password: &str) -> Result<String, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
-        // Ambiguous email addresses fail closed; an explicit tenant login can be
-        // added without allowing one tenant's password to select another user.
+        // Email addresses are unique across tenants ignoring case (migration
+        // 0011). Ambiguous rows still fail closed.
         let users: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT id,tenant_id,password_hash FROM users WHERE email=$1 ORDER BY id LIMIT 2",
+            "SELECT id,tenant_id,password_hash FROM users WHERE lower(email)=lower($1) ORDER BY id LIMIT 2",
         )
         .bind(email)
         .fetch_all(&db.pool)
         .await
         .map_err(database_error)?;
         let user = users.first().filter(|_| users.len() == 1);
-        let valid = verify_password(password, user.map(|row| row.2.as_str()).unwrap_or(""));
+        let valid = self
+            .login_throttle
+            .verify(password, user.map(|row| row.2.as_str()).unwrap_or(""))
+            .await;
         let (id, tenant, _) = user
             .filter(|_| valid)
             .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))?;
@@ -793,6 +799,39 @@ impl ApiState {
         Ok(json!({"user_id":user,"tenant_id":target}))
     }
 
+    /// Revoke an MSP grant and end the user's sessions in that tenant.
+    pub(super) async fn pg_revoke_grant(
+        &self,
+        principal: &Principal,
+        user: Uuid,
+        target: Uuid,
+    ) -> Result<(), ApiError> {
+        let db = self.db.as_ref().expect("PostgreSQL state");
+        let mut tx = db.pool.begin().await.map_err(database_error)?;
+        // Same authority as granting: a direct child and a user of this tenant.
+        let allowed:bool=sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants t JOIN users u ON u.tenant_id=t.parent_id WHERE t.id=$1 AND t.parent_id=$2 AND u.id=$3)").bind(target).bind(principal.tenant_id).bind(user).fetch_one(&mut *tx).await.map_err(database_error)?;
+        if !allowed {
+            return Err(fail(StatusCode::FORBIDDEN, "not allowed"));
+        }
+        let removed = sqlx::query("DELETE FROM msp_grants WHERE tenant_id=$1 AND user_id=$2")
+            .bind(target)
+            .bind(user)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        if removed.rows_affected() == 0 {
+            return Err(fail(StatusCode::NOT_FOUND, "not found"));
+        }
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1 AND active_tenant_id=$2")
+            .bind(user)
+            .bind(target)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        audit(&mut tx, principal, "grant.delete", &target.to_string()).await?;
+        tx.commit().await.map_err(database_error)
+    }
+
     pub(super) async fn pg_link_template(
         &self,
         principal: &Principal,
@@ -998,6 +1037,14 @@ impl ApiState {
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
+        if kind == "user" {
+            // Grants name users of a parent tenant and carry no foreign key.
+            sqlx::query("DELETE FROM msp_grants WHERE user_id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,
