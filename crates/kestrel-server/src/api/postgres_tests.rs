@@ -309,3 +309,148 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn api_postgres_reconciles_template_triggers_and_validates_host_names() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+        .bind(tenant)
+        .bind(format!("reconcile-test-{tenant}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let principal = Principal {
+        user_id: Uuid::new_v4(),
+        tenant_id: tenant,
+        email: format!("{tenant}@example.test"),
+        role: "owner".into(),
+        host_group_id: None,
+    };
+    let dir = std::env::temp_dir().join(format!("kestrel-api-reconcile-{tenant}"));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+    let id = |value: &Value| Uuid::parse_str(value["id"].as_str().unwrap()).unwrap();
+    // Names outside the PromQL label alphabet could never be scoped.
+    for name in ["web 1", "web\"1", ""] {
+        let err = state
+            .pg_insert(&principal, "host", json!({ "name": name }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{name}");
+    }
+    let host = id(&state
+        .pg_insert(&principal, "host", json!({"name":"switch-1.lan"}))
+        .await
+        .unwrap());
+    let err = state
+        .pg_update(&principal, "host", host, json!({"name":"switch 1"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    let template = id(&state
+        .pg_insert(&principal, "template", json!({"name":"SNMP"}))
+        .await
+        .unwrap());
+    let parent = id(&state
+        .pg_insert(&principal, "template", json!({"name":"Base"}))
+        .await
+        .unwrap());
+    let source = id(&state
+        .pg_insert(
+            &principal,
+            "trigger",
+            json!({"name":"down","expression":"snmp_up == 0","template_id":template}),
+        )
+        .await
+        .unwrap());
+    let copies = || async {
+        sqlx::query_as::<_, (String, String, bool, Option<Uuid>)>(
+            "SELECT name,expression,enabled,source_trigger_id FROM triggers WHERE tenant_id=$1 AND host_id=$2 ORDER BY name",
+        )
+        .bind(tenant)
+        .bind(host)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+    };
+    // An agentless host gets copies as soon as it is linked.
+    state
+        .pg_link_template(&principal, host, template)
+        .await
+        .unwrap();
+    assert_eq!(
+        copies().await,
+        vec![("down".into(), "snmp_up == 0".into(), true, Some(source))]
+    );
+    // Renames and edits reach the copy through its source.
+    state
+        .pg_update(
+            &principal,
+            "trigger",
+            source,
+            json!({"name":"unreachable","expression":"snmp_up < 1"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        copies().await,
+        vec![(
+            "unreachable".into(),
+            "snmp_up < 1".into(),
+            true,
+            Some(source)
+        )]
+    );
+    // Inherited triggers materialise when the parent link or trigger appears.
+    state
+        .pg_link_parent(&principal, template, parent)
+        .await
+        .unwrap();
+    let inherited = id(&state
+        .pg_insert(
+            &principal,
+            "trigger",
+            json!({"name":"base","expression":"up == 0","template_id":parent}),
+        )
+        .await
+        .unwrap());
+    assert_eq!(copies().await.len(), 2);
+    assert!(copies()
+        .await
+        .contains(&("base".into(), "up == 0".into(), true, Some(inherited))));
+    // Deleting a source disables its copy and keeps the row for history.
+    state
+        .pg_delete(&principal, "trigger", source)
+        .await
+        .unwrap();
+    assert!(copies()
+        .await
+        .contains(&("unreachable".into(), "snmp_up < 1".into(), false, None)));
+    // Detaching a trigger from its template retires its copies.
+    state
+        .pg_update(
+            &principal,
+            "trigger",
+            inherited,
+            json!({"template_id":null}),
+        )
+        .await
+        .unwrap();
+    assert!(copies()
+        .await
+        .contains(&("base".into(), "up == 0".into(), false, Some(inherited))));
+    state
+        .pg_update(&principal, "host", host, json!({"name":"switch-2.lan"}))
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

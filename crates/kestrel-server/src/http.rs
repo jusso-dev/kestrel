@@ -317,17 +317,11 @@ async fn ingest(
     if body.len() > ingest::INGEST_BODY_LIMIT {
         return axum::http::StatusCode::PAYLOAD_TOO_LARGE;
     }
-    let (tenant_id, host) = state
+    let (tenant_id, mut host_name) = state
         .store
         .agent_meta(agent.0)
         .unwrap_or((crate::store::DEFAULT_TENANT_ID, "unknown".to_string()));
-    let prepared =
-        match ingest::prepare_batch(&body, &tenant_id.to_string(), &host, &agent.0.to_string()) {
-            Ok(prepared) => prepared,
-            Err(IngestDecision::Rejected(_)) => return axum::http::StatusCode::BAD_REQUEST,
-            Err(_) => return axum::http::StatusCode::BAD_REQUEST,
-        };
-    let samples = u32::try_from(prepared.samples.len()).unwrap_or(u32::MAX);
+    let mut bound_host = None;
     if let Some(db) = &state.db {
         let Some(details) = state.store.agent_details(agent.0) else {
             return axum::http::StatusCode::UNAUTHORIZED;
@@ -336,6 +330,25 @@ async fn ingest(
             Ok(host) => host,
             Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE,
         };
+        // Hosts can be renamed after enrolment; triggers scope on the SQL name.
+        host_name = match current_host_name(db, tenant_id, host).await {
+            Some(name) => name,
+            None => return axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        };
+        bound_host = Some(host);
+    }
+    let prepared = match ingest::prepare_batch(
+        &body,
+        &tenant_id.to_string(),
+        &host_name,
+        &agent.0.to_string(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(IngestDecision::Rejected(_)) => return axum::http::StatusCode::BAD_REQUEST,
+        Err(_) => return axum::http::StatusCode::BAD_REQUEST,
+    };
+    let samples = u32::try_from(prepared.samples.len()).unwrap_or(u32::MAX);
+    if let (Some(db), Some(host)) = (&state.db, bound_host) {
         let last: Result<(i64,i32), _> =
             sqlx::query_as("SELECT a.last_seq,t.samples_per_second FROM agents a JOIN tenants t ON t.id=a.tenant_id WHERE a.tenant_id=$1 AND a.id=$2")
                 .bind(tenant_id)
@@ -376,6 +389,18 @@ async fn ingest(
     }
 }
 
+async fn current_host_name(
+    db: &crate::db::Db,
+    tenant: uuid::Uuid,
+    host: uuid::Uuid,
+) -> Option<String> {
+    db.get_host(&crate::db::TenantId(tenant), host)
+        .await
+        .ok()
+        .flatten()
+        .map(|row| row.name)
+}
+
 async fn agent_config(
     State(state): State<AppState>,
     axum::Extension(agent): axum::Extension<AuthedAgent>,
@@ -396,6 +421,9 @@ async fn agent_config(
         let host = match db.ensure_enrolled_agent(&details).await {
             Ok(host) => host,
             Err(_) => return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let Some(host_name) = current_host_name(db, details.tenant_id, host).await else {
+            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
         match db
             .linked_agent_config(details.tenant_id, host, host_name)

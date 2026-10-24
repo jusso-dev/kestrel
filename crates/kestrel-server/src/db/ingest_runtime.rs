@@ -202,7 +202,10 @@ impl Db {
             .collect::<BTreeMap<_, _>>();
         // Materialise per-host trigger definitions. The evaluator can now scope
         // the shared template expression to this host without alerting twice.
-        sqlx::query("WITH RECURSIVE linked(id) AS (SELECT template_id FROM template_links WHERE tenant_id=$1 AND host_id=$2 UNION SELECT p.parent_id FROM template_parents p JOIN linked l ON p.template_id=l.id WHERE p.tenant_id=$1) INSERT INTO triggers (tenant_id,host_id,template_id,name,expression,severity,for_seconds,recovery_expr,labels,interval_s,recover_for) SELECT t.tenant_id,$2,t.template_id,t.name,t.expression,t.severity,t.for_seconds,t.recovery_expr,t.labels,t.interval_s,t.recover_for FROM triggers t JOIN linked l ON l.id=t.template_id WHERE t.tenant_id=$1 AND t.host_id IS NULL ON CONFLICT (tenant_id,host_id,template_id,name) WHERE host_id IS NOT NULL AND template_id IS NOT NULL DO UPDATE SET expression=EXCLUDED.expression,severity=EXCLUDED.severity,for_seconds=EXCLUDED.for_seconds,recovery_expr=EXCLUDED.recovery_expr,interval_s=EXCLUDED.interval_s,recover_for=EXCLUDED.recover_for").bind(tenant).bind(host).execute(&self.pool).await.map_err(db_err)?;
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        super::reconcile_template_triggers(&mut conn, tenant, Some(host))
+            .await
+            .map_err(db_err)?;
         Ok(compile_agent_config(
             &HostView { name, overrides },
             &[TemplateDoc {
@@ -281,7 +284,11 @@ impl Db {
                 .succ_opt()
                 .ok_or_else(|| ServerError::new("invalid log date"))?;
             let partition = crate::ingest::log_partition_name(now.timestamp_millis());
-            sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {partition} PARTITION OF log_events FOR VALUES FROM ('{date}') TO ('{next}')")).execute(&mut *tx).await.map_err(db_err)?;
+            // Bounds are UTC whatever the session time zone, and rows carry the
+            // same `now` as created_at. Otherwise database clock skew around
+            // midnight files rows into log_events_default, and the next day's
+            // partition cannot be created while it holds them.
+            sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {partition} PARTITION OF log_events FOR VALUES FROM ('{date} 00:00:00+00') TO ('{next} 00:00:00+00')")).execute(&mut *tx).await.map_err(db_err)?;
             for log in batch.logs {
                 let observed = DateTime::from_timestamp_millis(log.timestamp_ms)
                     .ok_or_else(|| ServerError::new("invalid log timestamp"))?;
@@ -290,13 +297,32 @@ impl Db {
                     .into_iter()
                     .map(|label| (label.name, serde_json::Value::String(label.value)))
                     .collect::<serde_json::Map<_, _>>();
-                sqlx::query("INSERT INTO log_events (tenant_id,host_id,agent_id,source,line,labels,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)").bind(tenant).bind(host).bind(agent).bind(log.source).bind(log.line).bind(serde_json::Value::Object(labels)).bind(observed).execute(&mut *tx).await.map_err(db_err)?;
+                sqlx::query("INSERT INTO log_events (tenant_id,host_id,agent_id,source,line,labels,observed_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)").bind(tenant).bind(host).bind(agent).bind(log.source).bind(log.line).bind(serde_json::Value::Object(labels)).bind(observed).bind(now).execute(&mut *tx).await.map_err(db_err)?;
             }
             sqlx::query("DELETE FROM log_events WHERE created_at < now()-make_interval(days=>$1)")
                 .bind(self.log_retention_days)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
+            // Drop whole daily partitions once they age out; the DELETE above
+            // only empties them. Names come from the catalogue and must parse
+            // as a partition date to qualify.
+            let partitions: Vec<String> = sqlx::query_scalar("SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='log_events'::regclass")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            for name in partitions {
+                if crate::ingest::partition_is_expired(
+                    &name,
+                    &partition,
+                    i64::from(self.log_retention_days),
+                ) {
+                    sqlx::query(&format!("DROP TABLE IF EXISTS \"{name}\""))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                }
+            }
         }
         if let Some(inventory) = batch.inventory {
             self.apply_inventory(&mut tx, tenant, host, &inventory)
@@ -375,6 +401,11 @@ mod tests {
             host_group_id: None,
         };
         let host = db.ensure_enrolled_agent(&agent).await.unwrap();
+        // An aged-out daily partition is dropped by the next log ingest.
+        sqlx::query("CREATE TABLE IF NOT EXISTS log_events_2000_01_01 PARTITION OF log_events FOR VALUES FROM ('2000-01-01 00:00:00+00') TO ('2000-01-02 00:00:00+00')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let template: Uuid = sqlx::query_scalar(
             "INSERT INTO templates (tenant_id,name) VALUES ($1,'Disks') RETURNING id",
         )
@@ -462,6 +493,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logs, 1);
+        let partition = crate::ingest::log_partition_name(Utc::now().timestamp_millis());
+        let partitioned: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {partition} WHERE tenant_id=$1"
+        ))
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            partitioned, 1,
+            "rows must land in the partition named for them"
+        );
+        let expired: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('log_events_2000_01_01')::text")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(expired.is_none(), "expired partitions must be dropped");
         let entities: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM discovered_entities WHERE tenant_id=$1 AND rule_id=$2",
         )
