@@ -2086,6 +2086,9 @@ async fn create_grant(
             .await
             .map(Json);
     }
+    if !state.catalog.may_grant(&principal, user_id, tenant_id) {
+        return Err(fail(StatusCode::FORBIDDEN, "not allowed"));
+    }
     state.catalog.add_grant(user_id, tenant_id);
     state
         .catalog

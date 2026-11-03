@@ -1291,13 +1291,15 @@ async fn verify_off_runtime(
     password: String,
     candidates: Vec<LoginCandidate>,
 ) -> Result<(Vec<LoginCandidate>, LoginDecision), ApiError> {
-    let _permit = guard
-        .verify_permits
-        .acquire()
+    // The permit moves into the blocking task, so a dropped request cannot
+    // release it while Argon2 is still running.
+    let permit = std::sync::Arc::clone(&guard.verify_permits)
+        .acquire_owned()
         .await
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed"))?;
     tokio::task::spawn_blocking(move || {
         let decision = decide_login(&password, &candidates);
+        drop(permit);
         (candidates, decision)
     })
     .await

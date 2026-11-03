@@ -113,7 +113,7 @@ pub struct LoginGuard {
     accounts: Counter<String>,
     sources: Counter<IpAddr>,
     /// Bounds concurrent Argon2 verifications on the blocking pool.
-    pub(crate) verify_permits: tokio::sync::Semaphore,
+    pub(crate) verify_permits: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 /// Argon2 verifications that may run at once.
@@ -127,7 +127,7 @@ impl LoginGuard {
             window: window.clamp(Duration::from_secs(1), MAX_WINDOW),
             accounts: Counter::new(max_per_account),
             sources: Counter::new(max_per_source),
-            verify_permits: tokio::sync::Semaphore::new(VERIFY_PERMITS),
+            verify_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(VERIFY_PERMITS)),
         }
     }
 

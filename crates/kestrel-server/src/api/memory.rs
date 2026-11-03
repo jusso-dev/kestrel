@@ -514,6 +514,20 @@ impl MemoryCatalog {
         json!({ "items": items })
     }
 
+    /// The same authority PostgreSQL requires: a user of the principal's
+    /// tenant, into one of its direct child tenants.
+    pub fn may_grant(&self, principal: &Principal, user_id: Uuid, tenant_id: Uuid) -> bool {
+        let inner = self.lock();
+        inner
+            .tenants
+            .iter()
+            .any(|tenant| tenant.id == tenant_id && tenant.parent_id == Some(principal.tenant_id))
+            && inner
+                .users
+                .iter()
+                .any(|user| user.id == user_id && user.tenant_id == principal.tenant_id)
+    }
+
     /// Grants into the principal's direct child tenants.
     pub fn grants(&self, principal: &Principal) -> Value {
         let inner = self.lock();

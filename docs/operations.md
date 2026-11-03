@@ -82,7 +82,12 @@ Restore into an isolated environment first, using the same application version. 
 
 ## Upgrade
 
-Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0011 requires PostgreSQL 15 or later and stops with an error if two users share an email address (across tenants or by letter case); rename those users before upgrading. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
+Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0012 requires PostgreSQL 15 or later and stops with an error if two users share an email address, across tenants or by letter case. Migration 0013 then relaxes that to one address per tenant, ignoring case, so the same address can again exist in several tenants. Earlier releases refused sign-in for an address held in two tenants, so such accounts could not have been used. To upgrade a database that has them:
+
+1. Find them: `SELECT lower(email), array_agg(tenant_id || ':' || id) FROM users GROUP BY lower(email) HAVING count(*) > 1;`
+2. Give all but one of each group a temporary address that keeps the original: `UPDATE users SET email = 'kestrel-upgrade-' || id || '/' || email WHERE id = '<user id>';`
+3. Upgrade and start the server so migrations 0012 and 0013 run.
+4. Restore the original addresses: `UPDATE users SET email = substr(email, 54) WHERE email LIKE 'kestrel-upgrade-%/%';` (the prefix is 53 characters) and check the row count matches step 2. Two accounts that differ only by letter case in the same tenant are still refused, so merge or rename those. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
 
 Do not start an older binary against a migrated database unless its release explicitly supports that schema. To roll back an incompatible migration, stop the new server and restore the matching application, database and data-directory backup. Notification and SIEM delivery are at least once: a crash after remote acceptance but before transaction commit may redeliver a job. Receivers should deduplicate by problem or event identifier.
 
