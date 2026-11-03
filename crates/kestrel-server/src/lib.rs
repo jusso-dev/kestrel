@@ -12,6 +12,7 @@ pub mod escalation;
 pub mod forward;
 mod http;
 pub mod ingest;
+pub mod login_guard;
 pub mod maintenance;
 pub mod notify;
 pub mod otlp;
@@ -37,6 +38,12 @@ use std::error::Error;
 pub fn run() -> Result<(), ServerError> {
     config::init_tracing();
     let path = config::config_path_from_args(std::env::args().skip(1));
+    if config::config_flag_given(std::env::args().skip(1)) && !path.is_file() {
+        return Err(ServerError::new(format!(
+            "configuration file {} does not exist",
+            path.display()
+        )));
+    }
     let cfg = config::load_server_config(&path)?;
     tracing::info!(
         path = %path.display(),
@@ -60,11 +67,27 @@ pub fn run() -> Result<(), ServerError> {
             tracing::warn!(error = %err, "built-in templates were not loaded");
         }
         let server = start_with(cfg, Some(db.clone())).await?;
-        tokio::signal::ctrl_c().await?;
-        server.shutdown();
+        shutdown_signal().await?;
+        server.shutdown_and_wait().await;
         drop(db);
         Ok(())
     })
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 /// A failure while loading configuration or serving HTTPS.

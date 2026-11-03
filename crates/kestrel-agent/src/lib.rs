@@ -20,6 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
+const ENROL_RETRY_START: Duration = Duration::from_secs(5);
+const ENROL_RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Load configuration and collect until the process is interrupted.
 ///
 /// Samples are written to a size-capped segment log under the data directory
@@ -52,9 +55,32 @@ async fn serve(
     mut stop: Option<watch::Receiver<bool>>,
 ) -> Result<(), AgentError> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let identity = tokio::select! {
-        identity = identity::ensure(&cfg) => identity?,
-        _ = requested_stop(&mut stop) => return Ok(()),
+    config::validate_server_url(&cfg.server_url)?;
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    // The server may be down or the network not up yet at boot. Keep trying
+    // so a service manager without restart policies still ends up enrolled.
+    let mut delay = ENROL_RETRY_START;
+    let identity = loop {
+        tokio::select! {
+            identity = identity::ensure(&cfg) => match identity {
+                Ok(identity) => break identity,
+                Err(err) if err.is_retryable() => tracing::warn!(
+                    error = %err,
+                    retry_in_s = delay.as_secs(),
+                    "enrolment or certificate renewal failed"
+                ),
+                Err(err) => return Err(err.into()),
+            },
+            _ = requested_stop(&mut stop) => return Ok(()),
+            result = &mut shutdown => { result?; return Ok(()); },
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = requested_stop(&mut stop) => return Ok(()),
+            result = &mut shutdown => { result?; return Ok(()); },
+        }
+        delay = (delay * 2).min(ENROL_RETRY_MAX);
     };
     let agent_id = if let Some(id) = &identity {
         id.agent_id.clone()
@@ -173,7 +199,7 @@ async fn serve(
     });
 
     tokio::select! {
-        result = shutdown_signal() => result?,
+        result = &mut shutdown => result?,
         _ = requested_stop(&mut stop) => {},
     }
     let _ = shutdown_tx.send(true);
@@ -198,10 +224,11 @@ async fn serve(
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
-            _ = term.recv() => Ok(()),
+            _ = terminate.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -298,6 +325,41 @@ impl From<identity::IdentityError> for AgentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stop_interrupts_enrolment_retry() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dir = std::env::temp_dir().join(format!("kestrel-retry-{}", uuid::Uuid::new_v4()));
+        let cfg = config::AgentConfigFile {
+            server_url: format!("https://{address}").parse().unwrap(),
+            data_dir: dir.clone(),
+            enrol_token: Some("test-token".into()),
+            bootstrap_ca_path: None,
+            interval_s: 30,
+            buffer_max_mb: 1,
+            labels: Default::default(),
+            allow_remote_commands: false,
+            plugin_dirs: vec![],
+            prometheus_listen: None,
+            config_poll_s: 60,
+        };
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(serve(cfg, Some(stop_rx)));
+        let (connection, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("agent attempted enrolment")
+            .unwrap();
+        drop(connection);
+        drop(listener);
+        stop_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("stop should interrupt enrolment or its retry delay")
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn agent_id_is_stable_across_restarts() {

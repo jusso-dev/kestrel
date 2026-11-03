@@ -35,7 +35,7 @@ services:
       retries: 12
 
   victoria:
-    image: victoriametrics/victoria-metrics:latest
+    image: victoriametrics/victoria-metrics:v1.111.0
     command:
       - "-retentionPeriod=30d"
       - "-httpListenAddr=:8428"
@@ -45,7 +45,7 @@ services:
       - kestrel-metrics:/victoria-metrics-data
 
   mailpit:
-    image: axllent/mailpit:latest
+    image: axllent/mailpit:v1.33.0
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"

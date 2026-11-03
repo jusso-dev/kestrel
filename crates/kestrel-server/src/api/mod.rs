@@ -7,7 +7,6 @@ mod memory;
 mod postgres;
 #[cfg(test)]
 mod postgres_tests;
-mod throttle;
 
 pub use memory::{session_cookie, MemoryCatalog, Principal};
 
@@ -18,7 +17,7 @@ use crate::promql::inject_scope;
 use crate::store::{LabelledSample, MetricStore};
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
@@ -28,6 +27,7 @@ use http::HeaderValue;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -264,6 +264,20 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         operation: "openapi",
         auth: AuthKind::Public,
         location: Location::Api,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/healthz",
+        operation: "healthz",
+        auth: AuthKind::Public,
+        location: Location::Http,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/readyz",
+        operation: "readyz",
+        auth: AuthKind::Public,
+        location: Location::Http,
     },
     RouteSpec {
         method: "POST",
@@ -574,6 +588,13 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         location: Location::Api,
     },
     RouteSpec {
+        method: "GET",
+        path: "/api/v1/msp/grants",
+        operation: "msp_grants",
+        auth: AuthKind::User(Permission::TenantAdmin),
+        location: Location::Api,
+    },
+    RouteSpec {
         method: "DELETE",
         path: "/api/v1/msp/grants",
         operation: "delete_grant",
@@ -608,9 +629,10 @@ pub struct ApiState {
     pub(crate) quotas: Arc<crate::quota::Quotas>,
     pub(crate) directory: Option<Arc<crate::store::Directory>>,
     pub(crate) smtp: Option<crate::config::SmtpConfig>,
+    pub(crate) login_guard: Arc<crate::login_guard::LoginGuard>,
+    pub(crate) trusted_proxies: Arc<[IpAddr]>,
     /// Outbound policy for tenant-supplied URLs (checks, scrapes, webhooks).
     pub egress: Arc<kestrel_checks::EgressGuard>,
-    pub(crate) login_throttle: Arc<throttle::LoginThrottle>,
 }
 
 impl ApiState {
@@ -636,8 +658,9 @@ impl ApiState {
             quotas: Arc::new(crate::quota::Quotas::per_second(50_000)),
             directory: None,
             smtp: None,
+            login_guard: Arc::new(crate::login_guard::LoginGuard::default()),
+            trusted_proxies: Arc::from(Vec::new()),
             egress: Arc::new(kestrel_checks::EgressGuard::new(false)),
-            login_throttle: Arc::default(),
         }
     }
 }
@@ -660,11 +683,7 @@ pub fn router(state: ApiState) -> Router {
     for (path, methods) in groups {
         router = router.route(&axum_path(path), methods);
     }
-    let doc = serde_json::from_value(openapi_value()).expect("valid generated OpenAPI");
     router
-        .merge(
-            utoipa_swagger_ui::SwaggerUi::new("/api/v1/docs").url("/api/v1/docs/openapi.json", doc),
-        )
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
@@ -750,6 +769,7 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "switch_tenant" => post(switch_tenant),
         "msp_overview" => get(msp_overview),
         "create_grant" => post(create_grant),
+        "msp_grants" => get(msp_grants),
         "delete_grant" => axum::routing::delete(delete_grant),
         "otlp_metrics" => post(otlp_metrics),
         other => panic!("route {other} has no handler"),
@@ -793,7 +813,7 @@ pub fn openapi_value() -> Value {
             operation["parameters"] = json!(parameters);
             if spec.method == "POST" || spec.method == "PUT" || spec.operation == "delete_grant" {
                 let schema = if spec.operation == "login" {
-                    json!({"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string","format":"password"}}})
+                    json!({"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string","format":"password"},"tenant":{"type":"string","description":"Tenant name or id. Required when the email exists in more than one tenant."}}})
                 } else {
                     json!({"type":"object","additionalProperties":true})
                 };
@@ -903,6 +923,27 @@ struct Page {
 struct LoginBody {
     email: String,
     password: String,
+    /// Tenant name or id. Required when the email exists in several tenants.
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// One sign-in attempt. `source` is recorded in the audit log.
+pub(crate) struct LoginAttempt<'a> {
+    pub email: &'a str,
+    pub password: &'a str,
+    pub tenant: Option<&'a str>,
+    pub source: Option<IpAddr>,
+}
+
+pub(crate) enum LoginOutcome {
+    Session(String),
+    /// Wrong password, unknown email or unknown tenant. Callers cannot tell
+    /// which.
+    Refused,
+    /// The password is right for this email in more than one tenant, so the
+    /// caller has to pick one. Only those tenants are listed.
+    ChooseTenant(Vec<Value>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -924,46 +965,154 @@ struct MetricQuery {
     step: Option<u32>,
 }
 
+const MAX_LOGIN_EMAIL: usize = 320;
+const MAX_LOGIN_PASSWORD: usize = 1024;
+const MAX_LOGIN_TENANT: usize = 256;
+
+/// A user the sign-in could be for.
+pub(crate) struct LoginCandidate {
+    pub user_id: Uuid,
+    pub tenant_id: Uuid,
+    pub tenant_name: String,
+    pub password_hash: String,
+}
+
+/// Most accounts one email is checked against in a single sign-in.
+pub(crate) const MAX_LOGIN_CANDIDATES: usize = 10;
+
+pub(crate) enum LoginDecision {
+    Accept(usize),
+    Refuse,
+    Choose(Vec<usize>),
+}
+
+/// Check `password` against every candidate. An email that exists in several
+/// tenants never signs in without an explicit tenant, even when only one
+/// password matches, so one tenant's password cannot pick another's user.
+pub(crate) fn decide_login(password: &str, candidates: &[LoginCandidate]) -> LoginDecision {
+    if candidates.is_empty() {
+        // Spend the same Argon2 time as a real account.
+        let _ = crate::passwords::verify_password(password, "");
+        return LoginDecision::Refuse;
+    }
+    let matched: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            crate::passwords::verify_password(password, &candidate.password_hash)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match matched.as_slice() {
+        [] => LoginDecision::Refuse,
+        [only] if candidates.len() == 1 => LoginDecision::Accept(*only),
+        _ => LoginDecision::Choose(matched),
+    }
+}
+
+pub(crate) fn tenant_choices(candidates: &[LoginCandidate], matched: &[usize]) -> Vec<Value> {
+    matched
+        .iter()
+        .map(|&index| json!({"id": candidates[index].tenant_id, "name": candidates[index].tenant_name}))
+        .collect()
+}
+
 async fn login(
     State(state): State<ApiState>,
-    peer: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    connect: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
-    // Key failures on the address and the client, so nobody can lock another
-    // user out by failing logins for their address from elsewhere.
-    let throttle_key = format!(
-        "{}|{}",
-        body.email,
-        peer.map(|info| info.0.ip().to_string()).unwrap_or_default()
-    );
     if body.email.is_empty() || body.password.is_empty() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
             "email and password are required",
         ));
     }
-    if state.login_throttle.blocked(&throttle_key) {
-        return Err(fail(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-in attempts; try again later",
-        ));
+    // Bound the Argon2 input and the throttle keys before doing any work.
+    if body.email.len() > MAX_LOGIN_EMAIL
+        || body.password.len() > MAX_LOGIN_PASSWORD
+        || body
+            .tenant
+            .as_ref()
+            .is_some_and(|tenant| tenant.len() > MAX_LOGIN_TENANT)
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "sign-in field too long"));
     }
-    let result = if state.db.is_some() {
-        state.pg_login(&body.email, &body.password).await
-    } else {
-        state
-            .catalog
-            .login(&body.email, &body.password)
-            .map_err(|_| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))
-    };
-    match &result {
-        Ok(_) => state.login_throttle.succeeded(&throttle_key),
-        Err(err) if err.status == StatusCode::UNAUTHORIZED => {
-            state.login_throttle.failed(&throttle_key)
+    let forwarded = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = crate::login_guard::client_ip(
+        connect.map(|ConnectInfo(addr)| addr.ip()),
+        Some(forwarded.as_str()).filter(|value| !value.is_empty()),
+        &state.trusted_proxies,
+    );
+    let reservation = match state.login_guard.begin(&body.email, source) {
+        Ok(reservation) => reservation,
+        Err(throttled) => {
+            tracing::warn!(source = ?source, "sign-in throttled after repeated failures");
+            let mut response = fail(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed sign-in attempts; try again later",
+            )
+            .into_response();
+            let seconds = throttled.retry_after.as_secs().max(1).to_string();
+            if let Ok(value) = HeaderValue::from_str(&seconds) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return Ok(response);
         }
-        Err(_) => {}
-    }
-    let secret = result?;
+    };
+    let attempt = LoginAttempt {
+        // The guard and the lookups see the same identity.
+        email: body.email.trim(),
+        password: &body.password,
+        tenant: body
+            .tenant
+            .as_deref()
+            .map(str::trim)
+            .filter(|tenant| !tenant.is_empty()),
+        source,
+    };
+    let outcome = if state.db.is_some() {
+        match state.pg_login(&attempt).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // A server failure says nothing about the password.
+                state.login_guard.release(&body.email, source, reservation);
+                return Err(err);
+            }
+        }
+    } else {
+        state.catalog.login(&attempt)
+    };
+    let secret = match outcome {
+        LoginOutcome::Session(secret) => secret,
+        LoginOutcome::Refused => {
+            tracing::info!(source = ?source, "sign-in refused");
+            return Err(fail(StatusCode::UNAUTHORIZED, "invalid email or password"));
+        }
+        LoginOutcome::ChooseTenant(tenants) => {
+            state.login_guard.release(&body.email, source, reservation);
+            let body = json!({
+                "type": "about:blank",
+                "title": "Conflict",
+                "status": 409,
+                "detail": "this email belongs to more than one tenant; choose one",
+                "tenants": tenants,
+            });
+            return Ok((
+                StatusCode::CONFLICT,
+                [(header::CONTENT_TYPE, "application/problem+json")],
+                Json(body),
+            )
+                .into_response());
+        }
+    };
+    state.login_guard.release(&body.email, source, reservation);
     let cookie = session_cookie(&secret, state.secure_cookie);
     let mut response = Json(json!({ "email": body.email })).into_response();
     response.headers_mut().insert(
@@ -1894,22 +2043,34 @@ async fn msp_overview(
     Ok(Json(state.catalog.msp_overview(&principal)))
 }
 
+fn grant_ids(body: &Value) -> Result<(Uuid, Uuid), ApiError> {
+    let id = |field: &str| {
+        body.get(field)
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("{field} is required")))
+    };
+    Ok((id("user_id")?, id("tenant_id")?))
+}
+
+async fn msp_grants(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    if state.db.is_some() {
+        return state.pg_grants(&principal).await.map(Json);
+    }
+    Ok(Json(state.catalog.grants(&principal)))
+}
+
 async fn create_grant(
     State(state): State<ApiState>,
     AuthUser(principal): AuthUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::TenantAdmin)?;
-    let user_id = body
-        .get("user_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "user_id is required"))?;
-    let tenant_id = body
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "tenant_id is required"))?;
+    let (user_id, tenant_id) = grant_ids(&body)?;
     if state.db.is_some() {
         return state
             .pg_grant(
@@ -1920,6 +2081,9 @@ async fn create_grant(
             )
             .await
             .map(Json);
+    }
+    if !state.catalog.may_grant(&principal, user_id, tenant_id) {
+        return Err(fail(StatusCode::FORBIDDEN, "not allowed"));
     }
     state.catalog.add_grant(user_id, tenant_id);
     state
@@ -1939,22 +2103,13 @@ async fn delete_grant(
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
     ensure(&principal, Permission::TenantAdmin)?;
-    let user_id = body
-        .get("user_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "user_id is required"))?;
-    let tenant_id = body
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "tenant_id is required"))?;
+    let (user_id, tenant_id) = grant_ids(&body)?;
     if state.db.is_some() {
         state
             .pg_revoke_grant(&principal, user_id, tenant_id)
             .await?;
-    } else {
-        state.catalog.remove_grant(user_id, tenant_id);
+    } else if !state.catalog.revoke_grant(&principal, user_id, tenant_id) {
+        return Err(fail(StatusCode::NOT_FOUND, "not found"));
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2136,6 +2291,200 @@ mod tests {
             anon.get("/api/v1/hosts").await.status_code(),
             StatusCode::UNAUTHORIZED
         );
+    }
+
+    fn login_server(state: ApiState, source: &str) -> axum_test::TestServer {
+        let addr: SocketAddr = format!("{source}:40000").parse().unwrap();
+        axum_test::TestServer::builder()
+            .save_cookies()
+            .build(router(state).layer(axum::extract::connect_info::MockConnectInfo(addr)))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn login_failures_throttle_the_account_without_revealing_it_exists() {
+        let (mut state, _) = state_with("owner");
+        state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+            3,
+            100,
+            std::time::Duration::from_secs(600),
+        ));
+        let server = login_server(state.clone(), "192.0.2.1");
+        for email in ["owner@example.com", "ghost@example.com"] {
+            for _ in 0..3 {
+                let response = server
+                    .post("/api/v1/login")
+                    .json(&json!({ "email": email, "password": "guess" }))
+                    .await;
+                assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+            }
+            // Locked even with the right password, and identical for an
+            // unknown account.
+            let limited = server
+                .post("/api/v1/login")
+                .json(&json!({ "email": email, "password": "correct-horse" }))
+                .await;
+            assert_eq!(limited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+            let retry: u64 = limited
+                .header(header::RETRY_AFTER)
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!((1..=600).contains(&retry));
+            assert_eq!(
+                limited.json::<Value>()["detail"],
+                "too many failed sign-in attempts; try again later"
+            );
+        }
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "viewer@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+        // The owner, signing in from their own address, is not locked out.
+        login_server(state.clone(), "203.0.113.20")
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn login_failures_throttle_the_source_address() {
+        let (mut state, _) = state_with("owner");
+        state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+            100,
+            2,
+            std::time::Duration::from_secs(600),
+        ));
+        let attacker = login_server(state.clone(), "192.0.2.66");
+        for n in 0..2 {
+            let response = attacker
+                .post("/api/v1/login")
+                .json(&json!({ "email": format!("user{n}@example.com"), "password": "guess" }))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = attacker
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await;
+        assert_eq!(limited.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        // A forged X-Forwarded-For from an untrusted peer changes nothing.
+        let forged = attacker
+            .post("/api/v1/login")
+            .add_header(
+                http::HeaderName::from_static("x-forwarded-for"),
+                HeaderValue::from_static("203.0.113.9"),
+            )
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await;
+        assert_eq!(forged.status_code(), StatusCode::TOO_MANY_REQUESTS);
+        login_server(state, "192.0.2.67")
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn login_rejects_oversized_fields_without_counting_them() {
+        let (mut state, _) = state_with("owner");
+        state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+            1,
+            100,
+            std::time::Duration::from_secs(600),
+        ));
+        let server = login_server(state, "192.0.2.4");
+        for body in [
+            json!({ "email": "owner@example.com", "password": "x".repeat(1025) }),
+            json!({ "email": format!("{}@example.com", "a".repeat(320)), "password": "x" }),
+            json!({ "email": "owner@example.com", "password": "x", "tenant": "t".repeat(257) }),
+        ] {
+            server
+                .post("/api/v1/login")
+                .json(&body)
+                .await
+                .assert_status(StatusCode::BAD_REQUEST);
+        }
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn login_failures_are_audited_without_the_password() {
+        let (state, _) = state_with("owner");
+        let server = login_server(state, "192.0.2.5");
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "not-the-password" }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+        let audit = server.get("/api/v1/audit").await.json::<Value>();
+        let items = audit["items"].as_array().unwrap();
+        let failed = items
+            .iter()
+            .find(|item| item["action"] == "session.login_failed")
+            .expect("failed login audited");
+        assert_eq!(failed["target"], "owner@example.com");
+        assert_eq!(failed["detail"]["source"], "192.0.2.5");
+        assert!(items.iter().any(|item| item["action"] == "session.login"));
+        assert!(!audit.to_string().contains("not-the-password"));
+        assert!(!audit.to_string().contains("correct-horse"));
+    }
+
+    #[tokio::test]
+    async fn login_with_an_email_in_two_tenants_requires_a_tenant() {
+        let (state, _) = state_with("owner");
+        let other = Uuid::from_u128(12);
+        state.catalog.add_tenant(other, "globex", None);
+        state
+            .catalog
+            .add_user(other, "owner@example.com", "globex-horse", "viewer", None)
+            .unwrap();
+        let server = login_server(state, "192.0.2.9");
+        let wrong = server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "nope" }))
+            .await;
+        assert_eq!(wrong.status_code(), StatusCode::UNAUTHORIZED);
+        assert!(!wrong.text().contains("globex"));
+        let choose = server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "globex-horse" }))
+            .await;
+        assert_eq!(choose.status_code(), StatusCode::CONFLICT);
+        assert!(choose.maybe_cookie(SESSION_COOKIE).is_none());
+        assert_eq!(
+            choose.json::<Value>()["tenants"],
+            json!([{ "id": other, "name": "globex" }])
+        );
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse", "tenant": "globex" }))
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "globex-horse", "tenant": other.to_string() }))
+            .await
+            .assert_status_ok();
+        let tenants = server.get("/api/v1/audit").await.json::<Value>();
+        assert!(tenants["items"].to_string().contains(&other.to_string()));
+        server
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse", "tenant": "acme" }))
+            .await
+            .assert_status_ok();
     }
 
     #[tokio::test]

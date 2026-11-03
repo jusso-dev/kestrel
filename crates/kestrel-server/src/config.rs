@@ -3,7 +3,7 @@
 use figment::providers::{Env, Format, Toml};
 use figment::Figment;
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -97,6 +97,30 @@ pub struct ServerConfigFile {
     /// Off by default; see `docs/operations.md`.
     #[serde(default)]
     pub allow_loopback_targets: bool,
+    /// Reverse proxies whose `X-Forwarded-For` header names the client.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
+    #[serde(default)]
+    pub login: LoginConfig,
+}
+
+/// Failed sign-in limits. A key over its limit gets 429 until the window ends.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LoginConfig {
+    pub max_failures_per_account: u32,
+    pub max_failures_per_source: u32,
+    pub failure_window_secs: u64,
+}
+
+impl Default for LoginConfig {
+    fn default() -> Self {
+        Self {
+            max_failures_per_account: 10,
+            max_failures_per_source: 50,
+            failure_window_secs: 15 * 60,
+        }
+    }
 }
 
 fn default_log_retention_days() -> u32 {
@@ -133,6 +157,13 @@ pub fn config_path_from_args(args: impl IntoIterator<Item = impl AsRef<str>>) ->
         }
     }
     default_config_path(Platform::current())
+}
+
+/// True when `--config` was passed. A named file that is missing is an error;
+/// only the platform default may be absent.
+pub fn config_flag_given(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter()
+        .any(|arg| arg.as_ref() == "--config" || arg.as_ref().starts_with("--config="))
 }
 
 /// Load `path` (when it exists) and apply `KESTREL_` environment overrides.

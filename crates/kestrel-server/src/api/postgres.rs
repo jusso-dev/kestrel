@@ -1,7 +1,10 @@
 //! PostgreSQL API persistence. Identifiers come exclusively from the static
 //! resource map; all request values are bound parameters.
 
-use super::{fail, ApiError, ApiState, Principal};
+use super::{
+    decide_login, fail, tenant_choices, ApiError, ApiState, LoginAttempt, LoginCandidate,
+    LoginDecision, LoginOutcome, Principal, MAX_LOGIN_CANDIDATES,
+};
 use crate::passwords::{hash_password, random_token, token_hash};
 use axum::http::StatusCode;
 use serde_json::{json, Value};
@@ -10,7 +13,7 @@ use uuid::Uuid;
 
 fn database_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(ref database) = error {
-        if database.constraint() == Some("users_email_lower_key") {
+        if database.constraint() == Some("users_tenant_email_lower_key") {
             return fail(StatusCode::CONFLICT, "email address is already in use");
         }
         if database.is_unique_violation() {
@@ -388,45 +391,127 @@ impl ApiState {
         ))
     }
 
-    pub(super) async fn pg_login(&self, email: &str, password: &str) -> Result<String, ApiError> {
+    pub(super) async fn pg_login(
+        &self,
+        attempt: &LoginAttempt<'_>,
+    ) -> Result<LoginOutcome, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
-        // Email addresses are unique across tenants ignoring case (migration
-        // 0011). Ambiguous rows still fail closed.
-        let users: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT id,tenant_id,password_hash FROM users WHERE lower(email)=lower($1) ORDER BY id LIMIT 2",
+        let tenant = match attempt.tenant {
+            Some(tenant) => {
+                // A UUID-shaped value matches a tenant id first, then a name.
+                let id: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM tenants WHERE id::text=lower($1) OR name=$1 ORDER BY (id::text=lower($1)) DESC LIMIT 1",
+                )
+                .bind(tenant)
+                .fetch_optional(&db.pool)
+                .await
+                .map_err(database_error)?;
+                match id {
+                    Some(id) => Some(id),
+                    None => {
+                        verify_off_runtime(
+                            &self.login_guard,
+                            attempt.password.to_string(),
+                            Vec::new(),
+                        )
+                        .await?;
+                        return Ok(LoginOutcome::Refused);
+                    }
+                }
+            }
+            None => None,
+        };
+        let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
+            "SELECT u.id,u.tenant_id,t.name,u.password_hash FROM users u JOIN tenants t ON t.id=u.tenant_id \
+             WHERE lower(u.email)=lower($1) AND ($2::uuid IS NULL OR u.tenant_id=$2) ORDER BY t.name,u.id LIMIT $3",
         )
-        .bind(email)
+        .bind(attempt.email)
+        .bind(tenant)
+        .bind(MAX_LOGIN_CANDIDATES as i64)
         .fetch_all(&db.pool)
         .await
         .map_err(database_error)?;
-        let user = users.first().filter(|_| users.len() == 1);
-        let valid = self
-            .login_throttle
-            .verify(password, user.map(|row| row.2.as_str()).unwrap_or(""))
-            .await;
-        let (id, tenant, _) = user
-            .filter(|_| valid)
-            .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "invalid email or password"))?;
+        let candidates: Vec<LoginCandidate> = rows
+            .into_iter()
+            .map(
+                |(user_id, tenant_id, tenant_name, password_hash)| LoginCandidate {
+                    user_id,
+                    tenant_id,
+                    tenant_name,
+                    password_hash,
+                },
+            )
+            .collect();
+        let (candidates, decision) =
+            verify_off_runtime(&self.login_guard, attempt.password.to_string(), candidates).await?;
+        let detail = json!({ "email": attempt.email, "source": attempt.source });
+        let user = match decision {
+            LoginDecision::Accept(index) => &candidates[index],
+            LoginDecision::Choose(matched) => {
+                return Ok(LoginOutcome::ChooseTenant(tenant_choices(
+                    &candidates,
+                    &matched,
+                )))
+            }
+            LoginDecision::Refuse => {
+                let mut tx = db.pool.begin().await.map_err(database_error)?;
+                let targets: Vec<(Uuid, Uuid)> = match (candidates.is_empty(), tenant) {
+                    (false, _) => candidates
+                        .iter()
+                        .map(|candidate| (candidate.tenant_id, candidate.user_id))
+                        .collect(),
+                    // A named tenant owns attempts on emails it does not have.
+                    (true, Some(tenant)) => vec![(tenant, Uuid::nil())],
+                    (true, None) => Vec::new(),
+                };
+                for (tenant_id, user_id) in targets {
+                    let principal = Principal {
+                        user_id,
+                        tenant_id,
+                        email: attempt.email.to_string(),
+                        role: String::new(),
+                        host_group_id: None,
+                    };
+                    audit_detail(
+                        &mut tx,
+                        &principal,
+                        "session.login_failed",
+                        attempt.email,
+                        detail.clone(),
+                    )
+                    .await?;
+                }
+                tx.commit().await.map_err(database_error)?;
+                return Ok(LoginOutcome::Refused);
+            }
+        };
         let secret = random_token("sess_")
             .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "session creation failed"))?;
         let mut tx = db.pool.begin().await.map_err(database_error)?;
         sqlx::query("DELETE FROM sessions WHERE expires_at <= now() AND user_id=$1")
-            .bind(id)
+            .bind(user.user_id)
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
         sqlx::query("INSERT INTO sessions (tenant_id,active_tenant_id,user_id,token_hash,expires_at) VALUES ($1,$1,$2,$3,now()+interval '24 hours')")
-            .bind(tenant).bind(id).bind(token_hash(&secret)).execute(&mut *tx).await.map_err(database_error)?;
+            .bind(user.tenant_id).bind(user.user_id).bind(token_hash(&secret)).execute(&mut *tx).await.map_err(database_error)?;
         let principal = Principal {
-            user_id: *id,
-            tenant_id: *tenant,
-            email: email.to_string(),
+            user_id: user.user_id,
+            tenant_id: user.tenant_id,
+            email: attempt.email.to_string(),
             role: String::new(),
             host_group_id: None,
         };
-        audit(&mut tx, &principal, "session.login", &id.to_string()).await?;
+        audit_detail(
+            &mut tx,
+            &principal,
+            "session.login",
+            &user.user_id.to_string(),
+            detail,
+        )
+        .await?;
         tx.commit().await.map_err(database_error)?;
-        Ok(secret)
+        Ok(LoginOutcome::Session(secret))
     }
 
     pub(super) async fn pg_logout(
@@ -831,6 +916,20 @@ impl ApiState {
         Ok(json!({"user_id":user,"tenant_id":target}))
     }
 
+    pub(super) async fn pg_grants(&self, principal: &Principal) -> Result<Value, ApiError> {
+        let db = self.db.as_ref().expect("PostgreSQL state");
+        let rows: Vec<Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object('tenant_id',t.id,'tenant',t.name,'user_id',u.id,'email',u.email,'role',g.role) \
+             FROM msp_grants g JOIN tenants t ON t.id=g.tenant_id JOIN users u ON u.id=g.user_id \
+             WHERE t.parent_id=$1 ORDER BY t.name,u.email",
+        )
+        .bind(principal.tenant_id)
+        .fetch_all(&db.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(json!({ "items": rows }))
+    }
+
     /// Revoke an MSP grant and end the user's sessions in that tenant.
     pub(super) async fn pg_revoke_grant(
         &self,
@@ -1156,11 +1255,24 @@ pub(super) async fn audit(
     action: &str,
     target: &str,
 ) -> Result<(), ApiError> {
+    audit_detail(tx, principal, action, target, json!({})).await
+}
+
+async fn audit_detail(
+    tx: &mut Transaction<'_, Postgres>,
+    principal: &Principal,
+    action: &str,
+    target: &str,
+    detail: Value,
+) -> Result<(), ApiError> {
     // MSP actors belong to their home tenant; preserve the target audit scope
     // without creating an invalid user foreign key.
-    sqlx::query("INSERT INTO audit_log (tenant_id,user_id,action,target) VALUES ($1,CASE WHEN EXISTS (SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2) THEN $2 ELSE NULL END,$3,$4)").bind(principal.tenant_id).bind(principal.user_id).bind(action).bind(target).execute(&mut **tx).await.map_err(database_error)?;
+    sqlx::query("INSERT INTO audit_log (tenant_id,user_id,action,target,detail) VALUES ($1,CASE WHEN EXISTS (SELECT 1 FROM users WHERE tenant_id=$1 AND id=$2) THEN $2 ELSE NULL END,$3,$4,$5)").bind(principal.tenant_id).bind(principal.user_id).bind(action).bind(target).bind(&detail).execute(&mut **tx).await.map_err(database_error)?;
     let mut event = crate::forward::api_activity(action, &principal.email, action);
     event["unmapped"] = json!({"target":target,"actor_user_id":principal.user_id});
+    if let Some(source) = detail.get("source").filter(|source| !source.is_null()) {
+        event["src_endpoint"] = json!({ "ip": source });
+    }
     crate::runtime::enqueue_forward(tx, principal.tenant_id, "audit", &event)
         .await
         .map_err(|_| {
@@ -1170,4 +1282,26 @@ pub(super) async fn audit(
             )
         })?;
     Ok(())
+}
+
+/// Argon2 is CPU bound; keep it off the async workers and bound how many run
+/// at once so a burst of sign-ins cannot exhaust the blocking pool.
+async fn verify_off_runtime(
+    guard: &crate::login_guard::LoginGuard,
+    password: String,
+    candidates: Vec<LoginCandidate>,
+) -> Result<(Vec<LoginCandidate>, LoginDecision), ApiError> {
+    // The permit moves into the blocking task, so a dropped request cannot
+    // release it while Argon2 is still running.
+    let permit = std::sync::Arc::clone(&guard.verify_permits)
+        .acquire_owned()
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed"))?;
+    tokio::task::spawn_blocking(move || {
+        let decision = decide_login(&password, &candidates);
+        drop(permit);
+        (candidates, decision)
+    })
+    .await
+    .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed"))
 }

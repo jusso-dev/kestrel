@@ -84,12 +84,37 @@ pub fn needs_renew(not_before: i64, not_after: i64, now: i64) -> bool {
 #[derive(Debug)]
 pub struct IdentityError {
     message: String,
+    retryable: bool,
 }
 
 impl IdentityError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    pub(crate) fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    fn response(operation: &str, status: reqwest::StatusCode) -> Self {
+        let message = format!("{operation} failed with status {status}");
+        if status.is_server_error()
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        {
+            Self::transient(message)
+        } else {
+            Self::new(message)
         }
     }
 }
@@ -165,12 +190,9 @@ async fn enrol_new(cfg: &AgentConfigFile) -> Result<Identity, IdentityError> {
         })
         .send()
         .await
-        .map_err(|err| IdentityError::new(err.to_string()))?;
+        .map_err(|err| IdentityError::transient(err.to_string()))?;
     if !response.status().is_success() {
-        return Err(IdentityError::new(format!(
-            "enrolment failed with status {}",
-            response.status()
-        )));
+        return Err(IdentityError::response("enrolment", response.status()));
     }
     let body: EnrolResponse = response
         .json()
@@ -220,12 +242,9 @@ async fn renew(
         .json(&RenewRequest { csr_pem })
         .send()
         .await
-        .map_err(|err| IdentityError::new(err.to_string()))?;
+        .map_err(|err| IdentityError::transient(err.to_string()))?;
     if !response.status().is_success() {
-        return Err(IdentityError::new(format!(
-            "renewal failed with status {}",
-            response.status()
-        )));
+        return Err(IdentityError::response("renewal", response.status()));
     }
     let body: RenewResponse = response
         .json()
@@ -505,6 +524,25 @@ fn first_cert_der(pem: &str) -> Result<Vec<u8>, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrolment_errors_only_retry_transient_statuses() {
+        for status in [408, 429, 500, 503] {
+            assert!(IdentityError::response(
+                "enrolment",
+                reqwest::StatusCode::from_u16(status).unwrap()
+            )
+            .is_retryable());
+        }
+        for status in [400, 401, 403, 404] {
+            assert!(!IdentityError::response(
+                "enrolment",
+                reqwest::StatusCode::from_u16(status).unwrap()
+            )
+            .is_retryable());
+        }
+        assert!(!IdentityError::from(std::io::Error::other("bad identity files")).is_retryable());
+    }
 
     #[test]
     fn renewal_starts_at_two_thirds_of_the_lifetime() {

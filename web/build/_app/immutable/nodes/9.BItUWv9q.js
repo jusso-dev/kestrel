@@ -1,0 +1,1 @@
+import{a,f as s}from"../chunks/DYQ_848Z.js";import"../chunks/CAULInBf.js";import{s as m,f as e}from"../chunks/CRwhpHBf.js";import{P as p}from"../chunks/KcIAQqLW.js";var i=s('<h1 class="text-2xl">Problems</h1> <p class="mt-2 text-[var(--muted)]">Live problems for this tenant.</p> <!>',1);function h(t){var r=i(),o=m(e(r),4);p(o,{}),a(t,r)}export{h as component};

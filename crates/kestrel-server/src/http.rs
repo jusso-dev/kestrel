@@ -85,6 +85,36 @@ impl RunningServer {
             handle.graceful_shutdown(Some(std::time::Duration::from_secs(1)));
         }
     }
+
+    /// Stop accepting requests, wait for listeners, then drain queued writes.
+    pub async fn shutdown_and_wait(mut self) {
+        self.shutdown();
+        let listeners: Vec<_> = self.tasks.drain(..self.handles.len()).collect();
+        for mut task in listeners {
+            if tokio::time::timeout(std::time::Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        // The writer follows the listeners in `tasks`; all remaining tasks
+        // are long-running workers and must not hold shutdown open.
+        let mut writer = self.tasks.remove(0);
+        for task in self.tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        if tokio::time::timeout(std::time::Duration::from_secs(5), &mut writer)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ingest writer did not drain before shutdown deadline");
+            writer.abort();
+            let _ = writer.await;
+        }
+    }
 }
 
 impl Drop for RunningServer {
@@ -149,6 +179,12 @@ pub async fn start_with(
     api_state.smtp = cfg.smtp.clone();
     api_state.otlp_drop = cfg.otlp_drop_attributes.clone();
     api_state.egress = Arc::new(egress_guard(&cfg));
+    api_state.trusted_proxies = Arc::from(cfg.trusted_proxies.clone());
+    api_state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+        cfg.login.max_failures_per_account,
+        cfg.login.max_failures_per_source,
+        std::time::Duration::from_secs(cfg.login.failure_window_secs),
+    ));
     api_state.quotas = Arc::clone(&quotas);
     api_state.db = db.clone();
     api_state.secrets = Some(Arc::new(crate::secrets::SecretBox::load_or_create(
@@ -204,11 +240,40 @@ fn router(state: AppState, api_state: ApiState) -> Router {
         .route("/api/v1/agent/config", get(agent_config))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_agent));
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/v1/enrol", post(enrol))
         .merge(guarded)
         .with_state(state)
         .merge(crate::api::router(api_state))
         .merge(crate::web::router())
+}
+
+/// The process is serving requests.
+async fn healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// The server can reach PostgreSQL. Returns 503 otherwise, without detail.
+async fn readyz(State(state): State<AppState>) -> Response {
+    let ready = match &state.db {
+        Some(db) => tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sqlx::query("SELECT 1").execute(&db.pool),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok()),
+        None => true,
+    };
+    if ready {
+        Json(serde_json::json!({ "status": "ready" })).into_response()
+    } else {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "unavailable" })),
+        )
+            .into_response()
+    }
 }
 
 async fn bound_ingest(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -628,5 +693,41 @@ fn token_response(err: ServerError) -> ApiError {
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "enrolment store failed",
         )
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn shutdown_waits_for_listeners_and_queued_writes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        let listener = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            tx.send(()).await.unwrap();
+        });
+        let written = Arc::new(AtomicBool::new(false));
+        let observed = written.clone();
+        let writer = tokio::spawn(async move {
+            if rx.recv().await.is_some() {
+                observed.store(true, Ordering::SeqCst);
+            }
+        });
+        let worker = tokio::spawn(std::future::pending());
+        let server = RunningServer {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            ingest_addr: None,
+            handles: vec![axum_server::Handle::new()],
+            tasks: vec![listener, writer, worker],
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.shutdown_and_wait(),
+        )
+        .await
+        .expect("shutdown should finish");
+        assert!(written.load(Ordering::SeqCst));
     }
 }

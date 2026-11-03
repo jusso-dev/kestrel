@@ -34,9 +34,37 @@ An email media that names its own `smtp_host` or `smtp_port` does not inherit th
 
 ## Tenants
 
-Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. `DELETE /api/v1/msp/grants` with `{"user_id","tenant_id"}` revokes a grant and ends that user's sessions in the tenant. Ingest is limited per tenant; the limit responds with 429.
+Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429. An owner grants a user of their tenant a role in a direct child tenant with `POST /api/v1/msp/grants`, lists those grants with `GET /api/v1/msp/grants`, and revokes one with `DELETE /api/v1/msp/grants` and `{"user_id","tenant_id"}`, which also ends that user's sessions in the tenant.
 
-Email addresses are unique across all tenants, ignoring letter case, and sign-in matches them case-insensitively. After 10 failed sign-ins for one address from one client IP within 15 minutes, further attempts for that address from that IP receive 429 until the window ends. Behind a reverse proxy every client shares the proxy's IP, so the limit then applies per address.
+Email addresses are unique within a tenant, ignoring letter case, and sign-in matches them case-insensitively. The same address can have an account in more than one tenant. Sign-in then needs a tenant: `POST /api/v1/login` takes an optional `tenant` (name or id). Without one, a correct password returns 409 with the tenants it matched, and the UI asks the user to pick; a wrong password is a plain 401. An email in one tenant signs in as before. Without a tenant, the password is checked against each account that has the email (at most ten), so response time can hint that an address is in several tenants; it never reveals whether a single-tenant address exists. Naming the tenant avoids this.
+
+## Sign-in protection
+
+Failed sign-ins are counted per account from each source address (email, case-insensitive, plus the client address) and per source address (IPv4 address or IPv6 /64). Keying the account counter on the source means nobody can lock another user out from elsewhere; the source limit bounds password spraying across accounts. An attempt counts before the password is checked and is taken back when it succeeds or the server fails before judging it, so parallel guesses cannot overrun a limit and successful sign-ins from a shared NAT never lock it out. Once either limit is reached, sign-in for that key returns 429 with `Retry-After` until the window that began with its first failure ends (at most one day). Unknown emails are counted the same way, so a 429 does not reveal whether an account exists. Counters are kept in memory per server process. At most four Argon2 verifications run at once. Behind a reverse proxy that is not listed in `trusted_proxies`, every client shares the proxy's address.
+
+```toml
+# Defaults.
+[login]
+max_failures_per_account = 10
+max_failures_per_source = 50
+failure_window_secs = 900
+```
+
+Behind a reverse proxy, list the proxy addresses so the client address is read from `X-Forwarded-For` (the right-most address that is not a trusted proxy). The header is ignored from any other peer.
+
+```toml
+trusted_proxies = ["10.0.0.5"]
+```
+
+Every refused password is audited as `session.login_failed` in the tenant of each account it was tried against, with the attempted email and source address and never the password. An attempt naming a tenant that has no such email is audited in that tenant. An unknown email with no tenant has no tenant to own the record and is only written to the server log. Successful sign-ins are audited as `session.login` with the source address. Both are forwarded to configured SIEM targets with `src_endpoint.ip`.
+
+## Users
+
+Deleting a user ends their sessions and API tokens and removes their MSP grants. Their audit entries stay, with the user link cleared. This needs PostgreSQL 15 or later.
+
+## Health
+
+`GET /healthz` answers 200 while the process serves requests. `GET /readyz` answers 200 when PostgreSQL responds within two seconds and 503 otherwise. Neither needs authentication or returns detail. The server stops on SIGTERM or Ctrl-C, finishes in-flight requests and drains queued metric writes before exiting.
 
 Agent enrolment does not take over an existing host of the same name if the host has an active agent or sits outside the token's host group; enrolment then responds with 409. Revoke the old agent first.
 
@@ -54,13 +82,18 @@ Restore into an isolated environment first, using the same application version. 
 
 ## Upgrade
 
-Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0011 requires PostgreSQL 15 or later and stops with an error if two users share an email address (across tenants or by letter case); rename those users before upgrading. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
+Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0012 requires PostgreSQL 15 or later and stops with an error if two users share an email address, across tenants or by letter case. Migration 0013 then relaxes that to one address per tenant, ignoring case, so the same address can again exist in several tenants. Earlier releases refused sign-in for an address held in two tenants, so such accounts could not have been used. To upgrade a database that has them:
+
+1. Find them: `SELECT lower(email), array_agg(tenant_id || ':' || id) FROM users GROUP BY lower(email) HAVING count(*) > 1;`
+2. Give all but one of each group a temporary address that keeps the original: `UPDATE users SET email = 'kestrel-upgrade-' || id || '/' || email WHERE id = '<user id>';`
+3. Upgrade and start the server so migrations 0012 and 0013 run.
+4. Restore the original addresses: `UPDATE users SET email = substr(email, 54) WHERE email LIKE 'kestrel-upgrade-%/%';` (the prefix is 53 characters) and check the row count matches step 2. Two accounts that differ only by letter case in the same tenant are still refused, so merge or rename those. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
 
 Do not start an older binary against a migrated database unless its release explicitly supports that schema. To roll back an incompatible migration, stop the new server and restore the matching application, database and data-directory backup. Notification and SIEM delivery are at least once: a crash after remote acceptance but before transaction commit may redeliver a job. Receivers should deduplicate by problem or event identifier.
 
 ## Packaging and verification
 
-The [release recipe](ci/release.yml) builds both Linux musl architectures, checks static linkage and the 15 MB agent limit, builds the Windows MSI, signs the macOS agent and installer, notarises and staples the package, and packages the server as deb, rpm and a distroless container. macOS signing requires a configured runner keychain with Developer ID Application and Installer identities plus a notarytool profile. Native server packages built on Ubuntu 22.04 require glibc 2.35 or later; use the container on older distributions. See [validation](VALIDATION.md) for checks actually executed; a recipe is not evidence that platform installation passed.
+The [release recipe](../.github/workflows/release.yml) builds both Linux musl architectures, checks static linkage and the 15 MB agent limit, builds the Windows MSI, signs the macOS agent and installer, notarises and staples the package, and packages the server as deb, rpm and a distroless container. macOS signing requires a configured runner keychain with Developer ID Application and Installer identities plus a notarytool profile. Native server packages built on Ubuntu 22.04 require glibc 2.35 or later; use the container on older distributions. See [validation](VALIDATION.md) for checks actually executed; a recipe is not evidence that platform installation passed.
 
 Linux releases require the GitHub Actions secret `RELEASE_MINISIGN_SECRET_KEY`, containing the complete dedicated, unencrypted minisign secret-key file. Prepare that key outside CI with `minisign -G -W`, store its contents directly through GitHub's secret settings, and keep the original protected; never commit it or put its contents in logs or command arguments. The signing step writes it to an owner-only temporary file outside the artifact directory, removes the environment variable before invoking minisign, and deletes the file when the step exits. Missing or invalid signing configuration fails the job.
 

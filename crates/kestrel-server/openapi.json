@@ -1741,6 +1741,10 @@
                   "password": {
                     "format": "password",
                     "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Tenant name or id. Required when the email exists in more than one tenant.",
+                    "type": "string"
                   }
                 },
                 "required": [
@@ -2423,6 +2427,31 @@
           },
           "required": true
         },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "get": {
+        "operationId": "msp_grants",
+        "parameters": [],
         "responses": {
           "200": {
             "content": {
@@ -3686,6 +3715,46 @@
             "bearer": []
           }
         ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "security": []
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "security": []
       }
     },
     "/v1/metrics": {

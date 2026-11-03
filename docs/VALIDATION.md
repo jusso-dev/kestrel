@@ -37,12 +37,14 @@ The local Rust OCSF validator intentionally checks a pinned required-field subse
 
 Installer syntax and ShellCheck, release recipe YAML and shell syntax, WiX XML, the launchd plist, Compose configuration and Git whitespace checks passed. The recipe requires signing credentials, signs Linux agent binaries and checksums with minisign, and verifies those signatures before uploading artifacts. The macOS recipe requires Developer ID identities and a notarisation profile.
 
-The following release checks remain unverified and must not be represented as completed:
+`.github/workflows/packaging.yml` now runs these platform checks on every change to the crates or `deploy/`. Its first passing run was on 3 November 2026 ([run 41733914404](https://github.com/jusso-dev/kestrel/actions/runs/41733914404), PR #47):
 
-- Actual installation and enrolment on Ubuntu, Debian and RHEL using published release artifacts.
-- Actual Windows MSI installation followed by a running service and successful stop/shutdown.
-- An aarch64 musl artifact build and execution on a matching runner or emulator.
+- Static musl agents for x86_64 and aarch64 were built with `cross`, confirmed statically linked and under 15 MB (aarch64: 8,567,536 bytes), and run with `--version`. The aarch64 binary ran under `qemu-user`.
+- `curl … | sh -s -- --token …` installed the x86_64 agent from an HTTPS host with SHA-256 verification. It enrolled against a live server backed by PostgreSQL on the Ubuntu runner, with the systemd unit running and stopping cleanly, and in Debian 12 and RHEL UBI 9 containers. Configuration and key permissions were checked, and the server logged each enrolment.
+- The Windows MSI installed an automatic-start service that it did not start. After `--configure`, the service kept running while enrolment retried, stopped with exit code 0, and was removed on uninstall.
+- An unsigned macOS package installed the agent and launchd plist.
+
+The following release checks remain unverified and must not be represented as completed. They need the owner's signing credentials and are tracked by #49:
+
 - A Developer ID signed, notarised macOS package and its installation.
-- Running the documented release recipe with real signing credentials and publishing release artifacts.
-
-These are tracked by packaging issue #31. The Linux artifact and source-level service checks above are useful evidence, but do not replace these platform checks.
+- Running the release recipe with real signing credentials and publishing release artifacts, so the installer can fetch them by default.

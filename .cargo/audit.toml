@@ -1,0 +1,12 @@
+# cargo audit configuration. Every ignore needs a reason and a way out.
+# Unmaintained and unsound warnings are reported but do not fail the audit.
+
+[advisories]
+ignore = [
+    # rsa: Marvin timing side channel, no fixed release. rsa is never built:
+    # it reaches Cargo.lock only through sqlx-mysql, which sqlx names in weak
+    # `sqlx-mysql?/...` features (rust-lang/cargo#10801). `cargo tree -i rsa
+    # --target all -e all` prints nothing. Drop once sqlx or cargo stops
+    # locking unused optional dependencies.
+    "RUSTSEC-2023-0071",
+]
