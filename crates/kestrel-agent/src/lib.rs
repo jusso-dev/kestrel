@@ -220,6 +220,7 @@ async fn serve(
     Ok(())
 }
 
+/// Wait for Ctrl-C, or SIGTERM on Unix (sent by systemd and launchd on stop).
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {

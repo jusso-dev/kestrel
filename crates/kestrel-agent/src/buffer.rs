@@ -28,6 +28,8 @@ pub struct Buffer {
     segment_limit: u64,
     sync_interval: Duration,
     next_seq: u64,
+    /// `next_seq` as last written to the state file.
+    durable_next_seq: u64,
     acked_through: u64,
     dropped: u64,
     segments: Vec<Segment>,
@@ -131,6 +133,7 @@ impl Buffer {
             segment_limit,
             sync_interval,
             next_seq,
+            durable_next_seq: persisted.next_seq,
             acked_through: persisted.acked_through,
             dropped: persisted.dropped,
             segments,
@@ -466,6 +469,12 @@ impl Buffer {
     }
 
     fn remove_segment(&mut self, index: usize) -> io::Result<()> {
+        // A segment file may be the only durable record of sequences above
+        // the persisted `next_seq`. Persist first so a crash cannot reuse them.
+        let max_seq = self.segments[index].frames.last().map(|frame| frame.seq);
+        if max_seq.is_some_and(|seq| seq >= self.durable_next_seq) {
+            self.write_state()?;
+        }
         let segment = self.segments.remove(index);
         if self
             .open
@@ -558,7 +567,7 @@ impl Buffer {
             .find(|segment| segment.first_seq == first_seq)
     }
 
-    fn write_state(&self) -> io::Result<()> {
+    fn write_state(&mut self) -> io::Result<()> {
         let persisted = Persisted {
             next_seq: self.next_seq,
             acked_through: self.acked_through,
@@ -567,7 +576,9 @@ impl Buffer {
         let mut bytes = serde_json::to_vec(&persisted)
             .map_err(|err| io::Error::other(format!("buffer state: {err}")))?;
         bytes.push(b'\n');
-        write_atomic(&self.dir.join(STATE_FILE), &bytes)
+        write_atomic(&self.dir.join(STATE_FILE), &bytes)?;
+        self.durable_next_seq = self.next_seq;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -790,6 +801,28 @@ mod tests {
             vec![(2, "two".to_string()), (3, "three".to_string())]
         );
         assert!(buffer.peek().unwrap().is_none());
+    }
+
+    #[test]
+    fn buffer_crash_after_ack_does_not_reuse_sequences() {
+        let dir = TempDir(scratch("crash-ack"));
+        {
+            let mut buffer = Buffer::open_with(
+                dir.0.clone(),
+                8 * 1024 * 1024,
+                SEGMENT_ROLL_BYTES,
+                Duration::from_secs(3600),
+            )
+            .unwrap();
+            buffer.sync().unwrap();
+            buffer.append(&batch("one")).unwrap();
+            buffer.ack(1).unwrap();
+            // Simulate a crash: skip the final sync in `Drop`.
+            std::mem::forget(buffer);
+        }
+        let mut buffer = Buffer::open(&dir.0, 8 * 1024 * 1024).unwrap();
+        buffer.append(&batch("two")).unwrap();
+        assert_eq!(buffer.pending_seqs(), vec![2]);
     }
 
     #[test]

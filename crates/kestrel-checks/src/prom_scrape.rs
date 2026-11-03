@@ -14,6 +14,18 @@ pub async fn scrape_prometheus(
     timeout: Duration,
     now_ms: i64,
 ) -> Result<Vec<Sample>, String> {
+    scrape_prometheus_guarded(url, job, instance, timeout, now_ms, None).await
+}
+
+/// [`scrape_prometheus`] with connections restricted by `egress` when present.
+pub async fn scrape_prometheus_guarded(
+    url: &str,
+    job: &str,
+    instance: &str,
+    timeout: Duration,
+    now_ms: i64,
+    egress: Option<&std::sync::Arc<crate::EgressGuard>>,
+) -> Result<Vec<Sample>, String> {
     let parsed = reqwest::Url::parse(url).map_err(|_| "invalid scrape URL".to_string())?;
     if !matches!(parsed.scheme(), "http" | "https")
         || !parsed.username().is_empty()
@@ -21,11 +33,13 @@ pub async fn scrape_prometheus(
     {
         return Err("scrape URL must use HTTP(S) without embedded credentials".into());
     }
-    let client = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(timeout.max(Duration::from_millis(1)))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|err| err.to_string())?;
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(egress) = egress {
+        builder = egress.apply(builder, url).await?;
+    }
+    let client = builder.build().map_err(|err| err.to_string())?;
     let mut response = client
         .get(url)
         .send()

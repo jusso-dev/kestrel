@@ -595,9 +595,9 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         location: Location::Api,
     },
     RouteSpec {
-        method: "POST",
-        path: "/api/v1/msp/grants/revoke",
-        operation: "revoke_grant",
+        method: "DELETE",
+        path: "/api/v1/msp/grants",
+        operation: "delete_grant",
         auth: AuthKind::User(Permission::TenantAdmin),
         location: Location::Api,
     },
@@ -631,6 +631,8 @@ pub struct ApiState {
     pub(crate) smtp: Option<crate::config::SmtpConfig>,
     pub(crate) login_guard: Arc<crate::login_guard::LoginGuard>,
     pub(crate) trusted_proxies: Arc<[IpAddr]>,
+    /// Outbound policy for tenant-supplied URLs (checks, scrapes, webhooks).
+    pub egress: Arc<kestrel_checks::EgressGuard>,
 }
 
 impl ApiState {
@@ -658,6 +660,7 @@ impl ApiState {
             smtp: None,
             login_guard: Arc::new(crate::login_guard::LoginGuard::default()),
             trusted_proxies: Arc::from(Vec::new()),
+            egress: Arc::new(kestrel_checks::EgressGuard::new(false)),
         }
     }
 }
@@ -771,7 +774,7 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "msp_overview" => get(msp_overview),
         "create_grant" => post(create_grant),
         "msp_grants" => get(msp_grants),
-        "revoke_grant" => post(revoke_grant),
+        "delete_grant" => axum::routing::delete(delete_grant),
         "otlp_metrics" => post(otlp_metrics),
         other => panic!("route {other} has no handler"),
     }
@@ -802,6 +805,9 @@ pub fn openapi_value() -> Value {
             } else if spec.operation.starts_with("list_") {
                 parameters.push(json!({"name":"limit","in":"query","schema":{"type":"integer","minimum":1,"maximum":200}}));
                 parameters.push(json!({"name":"cursor","in":"query","schema":{"type":"string","format":"uuid"}}));
+                if spec.operation == "list_problems" {
+                    parameters.push(json!({"name":"status","in":"query","schema":{"type":"string","enum":["ok","pending","problem","resolved"]}}));
+                }
             }
             for parameter in &mut parameters {
                 if parameter.get("required").is_none() {
@@ -809,7 +815,7 @@ pub fn openapi_value() -> Value {
                 }
             }
             operation["parameters"] = json!(parameters);
-            if spec.method == "POST" || spec.method == "PUT" {
+            if spec.method == "POST" || spec.method == "PUT" || spec.operation == "delete_grant" {
                 let schema = if spec.operation == "login" {
                     json!({"type":"object","required":["email","password"],"properties":{"email":{"type":"string"},"password":{"type":"string","format":"password"},"tenant":{"type":"string","description":"Tenant name or id. Required when the email exists in more than one tenant."}}})
                 } else {
@@ -914,6 +920,7 @@ fn ensure(principal: &Principal, permission: Permission) -> Result<(), ApiError>
 struct Page {
     limit: Option<usize>,
     cursor: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -975,7 +982,7 @@ pub(crate) struct LoginCandidate {
 }
 
 /// Most accounts one email is checked against in a single sign-in.
-pub(crate) const MAX_LOGIN_CANDIDATES: usize = 20;
+pub(crate) const MAX_LOGIN_CANDIDATES: usize = 10;
 
 pub(crate) enum LoginDecision {
     Accept(usize),
@@ -1064,7 +1071,8 @@ async fn login(
         }
     };
     let attempt = LoginAttempt {
-        email: &body.email,
+        // The guard and the lookups see the same identity.
+        email: body.email.trim(),
         password: &body.password,
         tenant: body
             .tenant
@@ -1074,7 +1082,14 @@ async fn login(
         source,
     };
     let outcome = if state.db.is_some() {
-        state.pg_login(&attempt).await?
+        match state.pg_login(&attempt).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // A server failure says nothing about the password.
+                state.login_guard.release(&body.email, source, reservation);
+                return Err(err);
+            }
+        }
     } else {
         state.catalog.login(&attempt)
     };
@@ -1085,9 +1100,7 @@ async fn login(
             return Err(fail(StatusCode::UNAUTHORIZED, "invalid email or password"));
         }
         LoginOutcome::ChooseTenant(tenants) => {
-            state
-                .login_guard
-                .succeeded(&body.email, source, reservation);
+            state.login_guard.release(&body.email, source, reservation);
             let body = json!({
                 "type": "about:blank",
                 "title": "Conflict",
@@ -1103,9 +1116,7 @@ async fn login(
                 .into_response());
         }
     };
-    state
-        .login_guard
-        .succeeded(&body.email, source, reservation);
+    state.login_guard.release(&body.email, source, reservation);
     let cookie = session_cookie(&secret, state.secure_cookie);
     let mut response = Json(json!({ "email": body.email })).into_response();
     response.headers_mut().insert(
@@ -1605,6 +1616,7 @@ async fn list_kind(
                 kind,
                 page.limit.unwrap_or(50),
                 page.cursor.as_deref(),
+                page.status.as_deref(),
             )
             .await
             .map(Json);
@@ -1614,6 +1626,7 @@ async fn list_kind(
         kind,
         page.limit.unwrap_or(50),
         page.cursor.as_deref(),
+        page.status.as_deref(),
     )))
 }
 
@@ -1723,7 +1736,7 @@ async fn test_media(
         let result = if target["kind"] == "email" {
             crate::notify::send_smtp(&rendered, &target).await
         } else {
-            crate::notify::HttpNotifier::new()
+            crate::notify::HttpNotifier::guarded(state.egress.clone())
                 .send(&rendered, &target)
                 .await
         };
@@ -1740,7 +1753,7 @@ async fn test_media(
         .and_then(Value::as_str)
         .unwrap_or("memory://local");
     if !url.starts_with("memory://") {
-        let notifier = crate::notify::HttpNotifier::new();
+        let notifier = crate::notify::HttpNotifier::guarded(state.egress.clone());
         let rendered = crate::notify::render("test", "kestrel", "media", "1", url, "problem")
             .map_err(|err| fail(StatusCode::BAD_GATEWAY, err.to_string()))?;
         let target = json!({ "kind": media.get("kind").and_then(Value::as_str).unwrap_or("webhook"), "url": url, "webhook_url": url, "secret": media.get("secret").and_then(Value::as_str).unwrap_or("") });
@@ -2055,21 +2068,6 @@ async fn msp_grants(
     Ok(Json(state.catalog.grants(&principal)))
 }
 
-async fn revoke_grant(
-    State(state): State<ApiState>,
-    AuthUser(principal): AuthUser,
-    Json(body): Json<Value>,
-) -> Result<StatusCode, ApiError> {
-    ensure(&principal, Permission::TenantAdmin)?;
-    let (user_id, tenant_id) = grant_ids(&body)?;
-    if state.db.is_some() {
-        state.pg_revoke(&principal, user_id, tenant_id).await?;
-    } else if !state.catalog.revoke_grant(&principal, user_id, tenant_id) {
-        return Err(fail(StatusCode::NOT_FOUND, "not found"));
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
 async fn create_grant(
     State(state): State<ApiState>,
     AuthUser(principal): AuthUser,
@@ -2098,6 +2096,23 @@ async fn create_grant(
         )
         .map(Json)
         .map_err(|err| fail(StatusCode::BAD_REQUEST, err))
+}
+
+async fn delete_grant(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    let (user_id, tenant_id) = grant_ids(&body)?;
+    if state.db.is_some() {
+        state
+            .pg_revoke_grant(&principal, user_id, tenant_id)
+            .await?;
+    } else if !state.catalog.revoke_grant(&principal, user_id, tenant_id) {
+        return Err(fail(StatusCode::NOT_FOUND, "not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn otlp_metrics(
@@ -2295,7 +2310,7 @@ mod tests {
             100,
             std::time::Duration::from_secs(600),
         ));
-        let server = login_server(state, "192.0.2.1");
+        let server = login_server(state.clone(), "192.0.2.1");
         for email in ["owner@example.com", "ghost@example.com"] {
             for _ in 0..3 {
                 let response = server
@@ -2326,6 +2341,12 @@ mod tests {
         server
             .post("/api/v1/login")
             .json(&json!({ "email": "viewer@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+        // The owner, signing in from their own address, is not locked out.
+        login_server(state.clone(), "203.0.113.20")
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
             .await
             .assert_status_ok();
     }

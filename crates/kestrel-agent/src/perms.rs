@@ -20,7 +20,12 @@ pub fn write_certificate(path: &Path, pem: &str) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("crt.tmp");
-    std::fs::write(&tmp, pem)?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(pem.as_bytes())?;
+        file.sync_all()?;
+    }
     replace_file(&tmp, path)
 }
 

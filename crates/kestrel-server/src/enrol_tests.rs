@@ -42,6 +42,7 @@ fn server_config(dir: &Path) -> ServerConfigFile {
         otlp_drop_attributes: vec!["user_id".to_string()],
         trusted_proxies: Vec::new(),
         login: Default::default(),
+        allow_loopback_targets: false,
     }
 }
 

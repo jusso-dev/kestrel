@@ -6,6 +6,7 @@
 mod command;
 mod cpu;
 mod diskio;
+mod egress;
 mod filesystem;
 mod http;
 mod logs;
@@ -22,10 +23,11 @@ mod uptime;
 pub use command::{resolve_executable, run_command, CommandCheck, CommandError, CommandOutput};
 pub use cpu::CpuCollector;
 pub use diskio::DiskIoCollector;
+pub use egress::EgressGuard;
 pub use filesystem::FilesystemCollector;
 pub use http::{
-    expiry_from_der, probe_tls_expiry, run_http_check, with_expiry, HttpCheck, HttpOutcome,
-    RecordingVerifier,
+    expiry_from_der, probe_tls_expiry, run_http_check, run_http_check_guarded, with_expiry,
+    HttpCheck, HttpOutcome, RecordingVerifier,
 };
 pub use logs::{
     load_log_offsets, save_log_offsets, LogError, LogOffset, LogTailer, MAX_LOG_LINES_PER_TICK,
@@ -37,8 +39,8 @@ pub use network::NetworkCollector;
 pub use perfdata::{parse_perfdata, PerfPoint};
 pub use process::{ProcessCollector, TOP_PROCESSES};
 pub use prom_scrape::{
-    encode_exposition, parse_exposition, relabel, scrape_prometheus, to_agent_samples,
-    validate_exposition, ExpositionSample,
+    encode_exposition, parse_exposition, relabel, scrape_prometheus, scrape_prometheus_guarded,
+    to_agent_samples, validate_exposition, ExpositionSample,
 };
 pub use selfstats::SelfStatsCollector;
 pub use service::ServiceCollector;

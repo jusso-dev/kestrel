@@ -7,7 +7,7 @@ The tenant label is added by the server. Do not put a tenant matcher in a trigge
 ## Examples
 
 1. Disk above 90 percent: `kestrel_filesystem_used_ratio > 0.9`
-2. Agent silent for three minutes: `time() - kestrel_agent_last_seen_timestamp > 180`
+2. Agent silent for three minutes: `time() - max_over_time(kestrel_agent_last_seen_timestamp[24h]) > 180`
 3. Load above 8 (Unix hosts): `kestrel_load1 > 8`
 4. Memory above 90 percent: `kestrel_memory_used_bytes / kestrel_memory_total_bytes > 0.9`
 5. HTTP check down: `kestrel_http_up == 0`
@@ -18,3 +18,5 @@ The tenant label is added by the server. Do not put a tenant matcher in a trigge
 10. Interface down: `snmp_if_oper_status == 2`
 
 A built-in unreachable trigger uses example 2 for every agent.
+
+Wrap gauges that stop reporting in a range function such as `max_over_time(...[24h])`. An instant query only looks back about five minutes, so a bare `kestrel_agent_last_seen_timestamp` disappears before a 180 second delay completes and the problem never opens. With the 24 hour range, a host that stays silent for more than a day drops out of the result and its problem resolves. Remove or disable a host that is gone for good.

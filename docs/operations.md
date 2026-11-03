@@ -24,15 +24,23 @@ An action has steps with a delay. A later step is skipped once the problem is ac
 
 SIEM delivery is outbound only, to URLs an operator saved. Syslog uses TLS and RFC 5425 octet-counted frames. See [integrations/wedgetail.md](integrations/wedgetail.md).
 
+## Outbound requests
+
+Server-side HTTP checks, Prometheus scrapes, webhook, Slack, Teams and PagerDuty media, media tests and SIEM webhooks fetch URLs that tenant administrators supply. Before connecting, the server resolves the host and refuses loopback, link-local (including cloud metadata such as `169.254.169.254`), unspecified, multicast and broadcast addresses, IPv4-mapped forms of these, the configured `victoria_url` host and port, and the server's own listen addresses when they are bound to a specific IP. The check applies to the address actually connected, so DNS rebinding does not bypass it. Private ranges (RFC 1918 and IPv6 ULA) remain allowed. Redirects are not followed and proxy environment variables are ignored for these requests.
+
+To let these requests reach loopback, for example an exporter on the server host itself, set `allow_loopback_targets = true` (or `KESTREL_ALLOW_LOOPBACK_TARGETS=true`). The metric store stays refused either way. Leave it off on multi-tenant servers.
+
+An email media that names its own `smtp_host` or `smtp_port` does not inherit the server's SMTP username and password.
+
 ## Tenants
 
-Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429. An owner grants a user of their tenant a role in a direct child tenant with `POST /api/v1/msp/grants`, lists those grants with `GET /api/v1/msp/grants` and revokes one with `POST /api/v1/msp/grants/revoke` (`user_id`, `tenant_id`). Revoking moves any session that switched into the child back to the user's home tenant.
+Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429. An owner grants a user of their tenant a role in a direct child tenant with `POST /api/v1/msp/grants`, lists those grants with `GET /api/v1/msp/grants`, and revokes one with `DELETE /api/v1/msp/grants` and `{"user_id","tenant_id"}`, which also ends that user's sessions in the tenant.
 
-The same email address can have an account in more than one tenant. Sign-in then needs a tenant: `POST /api/v1/login` takes an optional `tenant` (name or id). Without one, a correct password returns 409 with the tenants it matched, and the UI asks the user to pick; a wrong password is a plain 401. An email in one tenant signs in as before.
+Email addresses are unique within a tenant, ignoring letter case, and sign-in matches them case-insensitively. The same address can have an account in more than one tenant. Sign-in then needs a tenant: `POST /api/v1/login` takes an optional `tenant` (name or id). Without one, a correct password returns 409 with the tenants it matched, and the UI asks the user to pick; a wrong password is a plain 401. An email in one tenant signs in as before. Without a tenant, the password is checked against each account that has the email (at most ten), so response time can hint that an address is in several tenants; it never reveals whether a single-tenant address exists. Naming the tenant avoids this.
 
 ## Sign-in protection
 
-Failed sign-ins are counted per account (email, case-insensitive) and per source address (IPv4 address or IPv6 /64). An attempt counts before the password is checked and is taken back when it succeeds, so parallel guesses cannot overrun a limit and successful sign-ins from a shared NAT never lock it out. Once either limit is reached, sign-in for that key returns 429 with `Retry-After` until the window that began with its first failure ends. Unknown emails are counted the same way, so a 429 does not reveal whether an account exists. Counters are kept in memory per server process.
+Failed sign-ins are counted per account from each source address (email, case-insensitive, plus the client address) and per source address (IPv4 address or IPv6 /64). Keying the account counter on the source means nobody can lock another user out from elsewhere; the source limit bounds password spraying across accounts. An attempt counts before the password is checked and is taken back when it succeeds or the server fails before judging it, so parallel guesses cannot overrun a limit and successful sign-ins from a shared NAT never lock it out. Once either limit is reached, sign-in for that key returns 429 with `Retry-After` until the window that began with its first failure ends (at most one day). Unknown emails are counted the same way, so a 429 does not reveal whether an account exists. Counters are kept in memory per server process. At most four Argon2 verifications run at once. Behind a reverse proxy that is not listed in `trusted_proxies`, every client shares the proxy's address.
 
 ```toml
 # Defaults.
@@ -58,6 +66,8 @@ Deleting a user ends their sessions and API tokens and removes their MSP grants.
 
 `GET /healthz` answers 200 while the process serves requests. `GET /readyz` answers 200 when PostgreSQL responds within two seconds and 503 otherwise. Neither needs authentication or returns detail. The server stops on SIGTERM or Ctrl-C, finishes in-flight requests and drains queued metric writes before exiting.
 
+Agent enrolment does not take over an existing host of the same name if the host has an active agent or sits outside the token's host group; enrolment then responds with 409. Revoke the old agent first.
+
 ## Roles
 
 See [rbac.md](rbac.md).
@@ -72,7 +82,7 @@ Restore into an isolated environment first, using the same application version. 
 
 ## Upgrade
 
-Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
+Take and verify a backup before replacing binaries or images. Preserve the server and agent data directories; agents must keep their identity and offline buffer. Review migration and release notes, stop the server, install the new version, then start it. PostgreSQL migrations run automatically. Migration 0011 requires PostgreSQL 15 or later and stops with an error if two users share an email address (across tenants or by letter case); rename those users before upgrading. Rebuild the web bundle before a source server build (`cd web && npm ci && npm run build`). The container build performs this step itself.
 
 Do not start an older binary against a migrated database unless its release explicitly supports that schema. To roll back an incompatible migration, stop the new server and restore the matching application, database and data-directory backup. Notification and SIEM delivery are at least once: a crash after remote acceptance but before transaction commit may redeliver a job. Receivers should deduplicate by problem or event identifier.
 

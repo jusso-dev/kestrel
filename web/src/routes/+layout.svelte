@@ -2,6 +2,7 @@
   import '../app.css';
   import { page } from '$app/stores';
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
 
   const links = [
     ['/', 'Overview'],
@@ -23,6 +24,12 @@
     document.documentElement.classList.toggle('dark', dark);
     localStorage.setItem('kestrel-theme', dark ? 'dark' : 'light');
   }
+
+  async function signOut() {
+    // The server clears the cookie; an expired session still lands on sign in.
+    try { await fetch('/api/v1/logout', { method: 'POST' }); } catch { /* offline: still leave */ }
+    await goto('/login');
+  }
 </script>
 
 <div class="min-h-screen md:grid md:grid-cols-[15rem_minmax(0,1fr)]">
@@ -35,7 +42,11 @@
       {#each links as [href, label]}
         <a href={href} class:font-semibold={$page.url.pathname === href}>{label}</a>
       {/each}
-      <a href="/login">Sign in</a>
+      {#if $page.url.pathname === '/login'}
+        <a href="/login" class="font-semibold">Sign in</a>
+      {:else}
+        <button type="button" class="text-left" on:click={signOut}>Sign out</button>
+      {/if}
     </nav>
   </aside>
   <main class="px-6 py-6">

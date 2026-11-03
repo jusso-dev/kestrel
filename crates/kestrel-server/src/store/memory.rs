@@ -69,6 +69,14 @@ struct Selector {
     op: Option<Cmp>,
     threshold: Option<f64>,
     time_minus: bool,
+    /// `max_over_time`/`last_over_time` and the window in seconds.
+    range: Option<(RangeFn, i64)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeFn {
+    Max,
+    Last,
 }
 
 #[derive(Debug)]
@@ -132,7 +140,7 @@ fn evaluate(
         points.sort_by_key(|(ts, _)| *ts);
         points.dedup_by_key(|(ts, _)| *ts);
         if instant {
-            let Some((ts, value)) = points.iter().rev().find(|(ts, _)| *ts <= end).copied() else {
+            let Some((ts, value)) = pick(&points, end, selector.range) else {
                 continue;
             };
             if !point_matches(&selector, end, value) {
@@ -153,9 +161,9 @@ fn evaluate(
             let mut bucketed = Vec::new();
             let mut cursor = start;
             while cursor <= end {
-                if let Some(point) = points.iter().rev().find(|(ts, _)| *ts <= cursor) {
+                if let Some(point) = pick(&points, cursor, selector.range) {
                     if point_matches(&selector, cursor, point.1) {
-                        bucketed.push(*point);
+                        bucketed.push(point);
                     }
                 }
                 cursor = cursor.saturating_add(i64::from(step_s));
@@ -168,6 +176,22 @@ fn evaluate(
         }
     }
     series
+}
+
+/// The value visible at `at`: the latest point, or the range function's result
+/// over `(at - window, at]`. Points are sorted by timestamp.
+fn pick(points: &[(i64, f64)], at: i64, range: Option<(RangeFn, i64)>) -> Option<(i64, f64)> {
+    let Some((func, window)) = range else {
+        return points.iter().rev().find(|(ts, _)| *ts <= at).copied();
+    };
+    let inside = points
+        .iter()
+        .filter(|(ts, _)| *ts <= at && *ts > at.saturating_sub(window))
+        .copied();
+    match func {
+        RangeFn::Last => inside.last(),
+        RangeFn::Max => inside.reduce(|best, point| if point.1 > best.1 { point } else { best }),
+    }
 }
 
 fn point_matches(selector: &Selector, at: i64, value: f64) -> bool {
@@ -242,6 +266,22 @@ fn parse_selector(input: &str) -> Option<Selector> {
     } else {
         (false, input)
     };
+    let mut range = None;
+    let mut owned = rest.to_string();
+    for (prefix, func) in [
+        ("max_over_time(", RangeFn::Max),
+        ("last_over_time(", RangeFn::Last),
+    ] {
+        if let Some(inner) = rest.strip_prefix(prefix) {
+            let open = find_unquoted(inner, '[')?;
+            let close = open + inner[open..].find(']')?;
+            let after = inner[close + 1..].trim_start().strip_prefix(')')?;
+            range = Some((func, parse_duration(&inner[open + 1..close])?));
+            owned = format!("{}{after}", &inner[..open]);
+            break;
+        }
+    }
+    let rest = owned.as_str();
     let mut chars = rest.chars().peekable();
     let mut name = String::new();
     while let Some(ch) = chars.peek().copied() {
@@ -282,7 +322,51 @@ fn parse_selector(input: &str) -> Option<Selector> {
         op,
         threshold,
         time_minus,
+        range,
     })
+}
+
+fn find_unquoted(source: &str, wanted: char) -> Option<usize> {
+    let mut quoted = false;
+    for (index, ch) in source.char_indices() {
+        if ch == '"' {
+            quoted = !quoted;
+        } else if ch == wanted && !quoted {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// PromQL durations such as `5m`, `24h` or `1d12h`, in whole seconds.
+fn parse_duration(text: &str) -> Option<i64> {
+    let mut chars = text.trim().chars().peekable();
+    let mut total = 0i64;
+    let mut seen = false;
+    while chars.peek().is_some() {
+        let mut digits = String::new();
+        while let Some(ch) = chars.peek().copied().filter(char::is_ascii_digit) {
+            digits.push(ch);
+            chars.next();
+        }
+        let count: i64 = digits.parse().ok()?;
+        let unit = match chars.next()? {
+            'm' if chars.peek() == Some(&'s') => {
+                chars.next();
+                0
+            }
+            's' => 1,
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            'w' => 604_800,
+            'y' => 31_536_000,
+            _ => return None,
+        };
+        total = total.checked_add(count.checked_mul(unit)?)?;
+        seen = true;
+    }
+    seen.then_some(total)
 }
 
 fn split_cmp(input: &str) -> Option<(Cmp, f64)> {
@@ -413,5 +497,38 @@ mod tests {
             .await
             .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreachable_agent_keeps_firing_past_the_instant_lookback() {
+        let store = MemoryStore::new();
+        store
+            .write(vec![sample(
+                "kestrel_agent_last_seen_timestamp",
+                &[("tenant", "a"), ("host", "web.1")],
+                1_000.0,
+                1_000_000,
+            )])
+            .await
+            .unwrap();
+        // The scoped form the evaluator sends, including a regex with brackets.
+        let scoped = crate::promql::inject_scope(
+            crate::rules::AGENT_UNREACHABLE_EXPR,
+            "a",
+            Some(&["web.1".to_string()]),
+        )
+        .unwrap();
+        for at in [1_000 + 181, 1_000 + 600, 1_000 + 86_000] {
+            assert_eq!(store.query(&scoped, at).await.unwrap().len(), 1, "{at}");
+        }
+        assert!(store.query(&scoped, 1_100).await.unwrap().is_empty());
+        assert!(store
+            .query(&scoped, 1_000 + 86_401)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(parse_duration("1d12h"), Some(129_600));
+        assert_eq!(parse_duration("500ms"), Some(0));
+        assert_eq!(parse_duration("5"), None);
     }
 }

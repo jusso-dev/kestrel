@@ -17,6 +17,8 @@ use tokio::time::MissedTickBehavior;
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// Flush immediately once this many collector samples are waiting.
 pub const FLUSH_MAX_SAMPLES: usize = 5000;
+/// Samples kept in memory while the buffer rejects appends. Oldest go first.
+pub const MAX_RETAINED_SAMPLES: usize = 20 * FLUSH_MAX_SAMPLES;
 
 /// Spawn one task per collector. Each task stops when `shutdown` changes.
 pub fn spawn_collectors(
@@ -122,7 +124,23 @@ fn flush(buffer: &Mutex<Buffer>, agent_id: &str, pending: &mut Vec<Sample>) {
     }
     match write_batch(buffer, agent_id, pending) {
         Ok(()) => pending.clear(),
-        Err(err) => tracing::error!(error = %err, "failed to append batch"),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to append batch");
+            cap_retained(pending, MAX_RETAINED_SAMPLES);
+        }
+    }
+}
+
+/// Drop the oldest samples so at most `max` stay queued for the next flush.
+fn cap_retained(pending: &mut Vec<Sample>, max: usize) {
+    let excess = pending.len().saturating_sub(max);
+    if excess > 0 {
+        pending.drain(..excess);
+        tracing::warn!(
+            dropped = excess,
+            retained = pending.len(),
+            "dropped oldest samples while the buffer is unavailable"
+        );
     }
 }
 
@@ -278,6 +296,16 @@ mod tests {
         drop(tx);
         task.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retained_samples_are_capped_dropping_the_oldest() {
+        let mut pending: Vec<_> = (0..10).map(|i| sample(i as f64)).collect();
+        cap_retained(&mut pending, 4);
+        let values: Vec<_> = pending.iter().map(|s| s.value).collect();
+        assert_eq!(values, [6.0, 7.0, 8.0, 9.0]);
+        cap_retained(&mut pending, 4);
+        assert_eq!(pending.len(), 4);
     }
 
     #[tokio::test(start_paused = true)]

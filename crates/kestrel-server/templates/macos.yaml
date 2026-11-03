@@ -22,6 +22,6 @@ triggers:
     severity: high
     for_seconds: 300
   - name: Agent is unreachable
-    expression: time() - kestrel_agent_last_seen_timestamp > 180
+    expression: time() - max_over_time(kestrel_agent_last_seen_timestamp[24h]) > 180
     severity: high
     for_seconds: 180

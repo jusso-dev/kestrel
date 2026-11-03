@@ -510,23 +510,7 @@ export interface paths {
         get: operations["msp_grants"];
         put?: never;
         post: operations["create_grant"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/msp/grants/revoke": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["revoke_grant"];
-        delete?: never;
+        delete: operations["delete_grant"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2485,7 +2469,7 @@ export interface operations {
             };
         };
     };
-    revoke_grant: {
+    delete_grant: {
         parameters: {
             query?: never;
             header?: never;
@@ -2562,6 +2546,7 @@ export interface operations {
             query?: {
                 limit?: number;
                 cursor?: string;
+                status?: "ok" | "pending" | "problem" | "resolved";
             };
             header?: never;
             path?: never;

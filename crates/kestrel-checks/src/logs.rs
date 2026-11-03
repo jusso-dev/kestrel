@@ -4,7 +4,10 @@
 //! `data_dir/log_offsets.json` so a restart does not send the same lines
 //! again. One tick returns at most 1000 lines, and each line is capped at
 //! 8 KiB. A partial line at the live end of the file is held until a newline
-//! arrives. Windows Event Log and journald are out of scope.
+//! arrives. A line longer than the cap is emitted as soon as the cap is
+//! reached and the remainder is skipped, at most
+//! [`MAX_LOG_SKIP_BYTES_PER_TICK`] bytes per tick, so an unterminated huge
+//! line is never rescanned. Windows Event Log and journald are out of scope.
 
 use kestrel_proto::v1::LogEvent;
 use regex::Regex;
@@ -17,6 +20,8 @@ use std::path::{Path, PathBuf};
 pub const MAX_LOG_LINES_PER_TICK: usize = 1000;
 /// Bytes kept from one line. The rest of the line is discarded.
 pub const MAX_LOG_LINE_BYTES: usize = 8 * 1024;
+/// Bytes of an over-long line's remainder discarded in one tick.
+pub const MAX_LOG_SKIP_BYTES_PER_TICK: u64 = 1024 * 1024;
 
 const OFFSETS_FILE: &str = "log_offsets.json";
 
@@ -29,6 +34,9 @@ pub struct LogTailer {
     /// `true` once `offset` and `inode` came from a checkpoint or a poll.
     checkpoint: bool,
     max_lines: usize,
+    /// `true` while discarding the rest of a line already emitted truncated.
+    /// Not persisted: after a restart the remainder is read as a new line.
+    skipping: bool,
 }
 
 #[derive(Debug)]
@@ -86,6 +94,7 @@ impl LogTailer {
             file: None,
             checkpoint: false,
             max_lines: MAX_LOG_LINES_PER_TICK,
+            skipping: false,
         })
     }
 
@@ -116,6 +125,7 @@ impl LogTailer {
             self.inode = found.inode;
             self.checkpoint = true;
             self.file = None;
+            self.skipping = false;
         }
     }
 
@@ -145,6 +155,7 @@ impl LogTailer {
                 self.offset = 0;
                 self.inode = 0;
                 self.checkpoint = false;
+                self.skipping = false;
                 if path_gone {
                     break;
                 }
@@ -168,10 +179,12 @@ impl LogTailer {
         if self.checkpoint && self.inode == id {
             if len < self.offset {
                 self.offset = 0;
+                self.skipping = false;
             }
         } else {
             self.offset = 0;
             self.inode = id;
+            self.skipping = false;
         }
         self.checkpoint = true;
         file.seek(SeekFrom::Start(self.offset))?;
@@ -205,6 +218,7 @@ impl LogTailer {
         };
         if file.metadata()?.len() < self.offset {
             self.offset = 0;
+            self.skipping = false;
         }
         Ok(())
     }
@@ -222,6 +236,7 @@ impl LogTailer {
         read_new_lines(
             file,
             &mut self.offset,
+            &mut self.skipping,
             pattern.as_ref(),
             source,
             ReadLimits {
@@ -261,6 +276,8 @@ struct RawLine {
     bytes: Vec<u8>,
     consumed: u64,
     partial: bool,
+    /// The line is longer than the cap and its remainder is still unread.
+    oversized: bool,
 }
 
 fn compile_pattern(pattern: Option<&str>) -> Result<Option<Regex>, LogError> {
@@ -335,6 +352,7 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn read_new_lines(
     file: &mut File,
     offset: &mut u64,
+    skipping: &mut bool,
     pattern: Option<&Regex>,
     source: &str,
     limits: ReadLimits,
@@ -343,6 +361,17 @@ fn read_new_lines(
     file.seek(SeekFrom::Start(*offset))?;
     let mut lines = 0;
     while lines < limits.max_lines {
+        if *skipping {
+            let (consumed, found) = skip_to_newline(file, MAX_LOG_SKIP_BYTES_PER_TICK)?;
+            *offset = offset.saturating_add(consumed);
+            if !found {
+                return Ok(ReadOutcome {
+                    stop: ReadStop::Eof,
+                    lines,
+                });
+            }
+            *skipping = false;
+        }
         match read_one_line(file, MAX_LOG_LINE_BYTES)? {
             None => {
                 return Ok(ReadOutcome {
@@ -359,6 +388,7 @@ fn read_new_lines(
             }
             Some(line) => {
                 *offset = offset.saturating_add(line.consumed);
+                *skipping = line.oversized;
                 lines += 1;
                 let text = String::from_utf8_lossy(&line.bytes).into_owned();
                 let matches = match pattern {
@@ -398,9 +428,22 @@ fn read_one_line(file: &mut File, max_bytes: usize) -> std::io::Result<Option<Ra
                 bytes: kept,
                 consumed,
                 partial: true,
+                oversized: false,
             }));
         }
         for (index, byte) in chunk[..filled].iter().enumerate() {
+            if *byte != b'\n' && kept.len() >= max_bytes {
+                // Stop at the cap instead of scanning to the newline, which
+                // may be arbitrarily far away or not written yet.
+                let unread = i64::try_from(filled - index).unwrap_or(0);
+                file.seek(SeekFrom::Current(-unread))?;
+                return Ok(Some(RawLine {
+                    bytes: kept,
+                    consumed,
+                    partial: false,
+                    oversized: true,
+                }));
+            }
             consumed += 1;
             if *byte == b'\n' {
                 let unread = filled - (index + 1);
@@ -415,13 +458,36 @@ fn read_one_line(file: &mut File, max_bytes: usize) -> std::io::Result<Option<Ra
                     bytes: kept,
                     consumed,
                     partial: false,
+                    oversized: false,
                 }));
             }
-            if kept.len() < max_bytes {
-                kept.push(*byte);
-            }
+            kept.push(*byte);
         }
     }
+}
+
+/// Discard bytes up to and including the next newline, reading at most
+/// `budget` bytes. Returns the bytes consumed and whether the newline was found.
+/// The file cursor is left at the first byte that was not consumed.
+fn skip_to_newline(file: &mut File, budget: u64) -> std::io::Result<(u64, bool)> {
+    let mut consumed = 0u64;
+    let mut chunk = [0u8; 8192];
+    while consumed < budget {
+        let want = usize::try_from((budget - consumed).min(chunk.len() as u64)).unwrap_or(0);
+        let filled = file.read(&mut chunk[..want])?;
+        if filled == 0 {
+            break;
+        }
+        if let Some(index) = chunk[..filled].iter().position(|byte| *byte == b'\n') {
+            let unread = i64::try_from(filled - (index + 1)).unwrap_or(0);
+            if unread > 0 {
+                file.seek(SeekFrom::Current(-unread))?;
+            }
+            return Ok((consumed + index as u64 + 1, true));
+        }
+        consumed += filled as u64;
+    }
+    Ok((consumed, false))
 }
 
 fn open_shared(path: &Path) -> std::io::Result<File> {
@@ -683,6 +749,38 @@ mod tests {
         drop(file);
         assert_eq!(event_lines(&tailer.poll(3).unwrap()), ["ERROR again"]);
         assert!(LogTailer::open(&path, Some("(")).is_err());
+    }
+
+    #[test]
+    fn logs_unterminated_huge_line_is_emitted_once_and_not_rescanned() {
+        let scratch = Scratch::new("huge-partial");
+        let path = scratch.path().join("app.log");
+        let size = MAX_LOG_SKIP_BYTES_PER_TICK * 2 + MAX_LOG_SKIP_BYTES_PER_TICK / 2;
+        std::fs::write(&path, vec![b'X'; usize::try_from(size).unwrap()]).unwrap();
+        let mut tailer = LogTailer::open(&path, None).unwrap();
+
+        let first = tailer.poll(1).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].line.len(), MAX_LOG_LINE_BYTES);
+        let cap = MAX_LOG_LINE_BYTES as u64;
+        assert_eq!(tailer.offset, cap + MAX_LOG_SKIP_BYTES_PER_TICK);
+
+        // Each tick discards at most the skip budget and never rescans.
+        assert!(tailer.poll(2).unwrap().is_empty());
+        assert_eq!(tailer.offset, cap + 2 * MAX_LOG_SKIP_BYTES_PER_TICK);
+        assert!(tailer.poll(3).unwrap().is_empty());
+        assert_eq!(tailer.offset, size);
+        assert!(tailer.poll(4).unwrap().is_empty());
+        assert_eq!(tailer.offset, size);
+
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"XXX\nnext\n").unwrap();
+        drop(file);
+        assert_eq!(event_lines(&tailer.poll(5).unwrap()), ["next"]);
     }
 
     #[test]

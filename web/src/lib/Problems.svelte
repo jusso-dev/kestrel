@@ -5,22 +5,28 @@
   let items: Resource[] = [];
   let error = '';
   let search = '';
-  let status = '';
   let severity = '';
   let active = true;
   let loading = false;
   let reload = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   async function load() {
     if (loading) { reload = true; return; }
     loading = true;
     do {
       reload = false;
       try {
-        const next = await list<Resource>('/problems');
+        // Only open problems; resolved rows stay in the history, not the work queue.
+        const next = await list<Resource>('/problems', { status: 'problem' });
         if (active) { items = next; error = ''; }
       } catch (cause) { if (active) error = cause instanceof Error ? cause.message : 'Unable to load problems.'; }
     } while (active && reload);
     loading = false;
+  }
+  // Event bursts coalesce into one reload instead of one full fetch per event.
+  function schedule() {
+    if (timer) return;
+    timer = setTimeout(() => { timer = undefined; void load(); }, 750);
   }
   async function ack(id: string) {
     try {
@@ -33,19 +39,18 @@
   onMount(() => {
     active = true;
     const events = new EventSource('/api/v1/events/stream');
-    events.onmessage = () => void load();
-    events.addEventListener('problem', () => void load());
-    events.onopen = () => void load();
+    events.onmessage = schedule;
+    events.addEventListener('problem', schedule);
+    events.onopen = schedule;
     void load();
-    return () => { active = false; events.close(); };
+    return () => { active = false; clearTimeout(timer); events.close(); };
   });
   $: visible = items.filter((item) => (!search || (item.name ?? item.id).toLowerCase().includes(search.toLowerCase())) &&
-    (!status || item.status === status) && (!severity || item.severity === severity));
+    (!severity || item.severity === severity));
 </script>
 {#if filters}
   <div class="my-4 flex flex-wrap gap-3">
     <label>Search <input class="border border-[var(--line)] bg-transparent" bind:value={search} /></label>
-    <label>Status <select class="bg-[var(--bg)]" bind:value={status}><option value="">All</option>{#each [...new Set(items.map((p) => p.status).filter(Boolean))] as value}<option>{value}</option>{/each}</select></label>
     <label>Severity <select class="bg-[var(--bg)]" bind:value={severity}><option value="">All</option>{#each [...new Set(items.map((p) => p.severity).filter(Boolean))] as value}<option>{value}</option>{/each}</select></label>
   </div>
 {/if}
@@ -53,8 +58,8 @@
 <ul class="mt-4 space-y-3" aria-label="Problems">
   {#each visible as problem (problem.id)}
     <li class="flex items-center justify-between gap-4 border border-[var(--line)] px-3 py-2">
-      <span>{problem.name ?? problem.id} {problem.status ?? ''} {problem.severity ?? ''}</span>
-      <button type="button" disabled={problem.acknowledged || !!problem.acknowledged_at} class="border border-[var(--line)] px-2 py-1" on:click={() => ack(problem.id)}>{problem.acknowledged || problem.acknowledged_at ? 'Acknowledged' : 'Acknowledge'}</button>
+      <span>{problem.name || problem.id} {problem.severity ?? ''}</span>
+      <button type="button" disabled={problem.status !== 'problem' || !!problem.acknowledged_at} class="border border-[var(--line)] px-2 py-1" on:click={() => ack(problem.id)}>{problem.acknowledged_at ? 'Acknowledged' : 'Acknowledge'}</button>
     </li>
   {:else}<li>No matching problems.</li>{/each}
 </ul>

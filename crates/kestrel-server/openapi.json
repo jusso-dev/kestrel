@@ -2413,33 +2413,8 @@
       }
     },
     "/api/v1/msp/grants": {
-      "get": {
-        "operationId": "msp_grants",
-        "parameters": [],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object"
-                }
-              }
-            },
-            "description": "OK"
-          }
-        },
-        "security": [
-          {
-            "session": []
-          },
-          {
-            "bearer": []
-          }
-        ]
-      },
-      "post": {
-        "operationId": "create_grant",
+      "delete": {
+        "operationId": "delete_grant",
         "parameters": [],
         "requestBody": {
           "content": {
@@ -2473,11 +2448,34 @@
             "bearer": []
           }
         ]
-      }
-    },
-    "/api/v1/msp/grants/revoke": {
+      },
+      "get": {
+        "operationId": "msp_grants",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          }
+        },
+        "security": [
+          {
+            "session": []
+          },
+          {
+            "bearer": []
+          }
+        ]
+      },
       "post": {
-        "operationId": "revoke_grant",
+        "operationId": "create_grant",
         "parameters": [],
         "requestBody": {
           "content": {
@@ -2580,6 +2578,20 @@
             "required": false,
             "schema": {
               "format": "uuid",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "enum": [
+                "ok",
+                "pending",
+                "problem",
+                "resolved"
+              ],
               "type": "string"
             }
           }

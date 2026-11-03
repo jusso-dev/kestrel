@@ -97,6 +97,28 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         .await
         .unwrap();
     let host_id = Uuid::parse_str(host["id"].as_str().unwrap()).unwrap();
+    let trigger: Uuid = sqlx::query_scalar("INSERT INTO triggers (tenant_id,host_id,name,expression,severity) VALUES ($1,$2,'CPU saturated','up == 0','high') RETURNING id")
+        .bind(tenant).bind(host_id).fetch_one(&db.pool).await.unwrap();
+    for status in ["problem", "resolved"] {
+        sqlx::query("INSERT INTO problems (tenant_id,trigger_id,host_id,status,severity) VALUES ($1,$2,$3,$4,'high')")
+            .bind(tenant).bind(trigger).bind(host_id).bind(status).execute(&db.pool).await.unwrap();
+    }
+    let open = state
+        .pg_list(&principal, "problem", 50, None, Some("problem"))
+        .await
+        .unwrap();
+    assert_eq!(open["items"].as_array().unwrap().len(), 1);
+    assert_eq!(open["items"][0]["name"], "CPU saturated on web-1");
+    assert_eq!(
+        state
+            .pg_list(&principal, "problem", 50, None, None)
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     let dashboard = state
         .pg_insert(
             &principal,
@@ -141,7 +163,7 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         .unwrap()
         .is_some());
     assert!(state
-        .pg_list(&principal, "token", 50, None)
+        .pg_list(&principal, "token", 50, None, None)
         .await
         .unwrap()
         .to_string()
@@ -184,7 +206,10 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     scoped.role = "operator".into();
     scoped.host_group_id = Some(Uuid::new_v4());
     assert_eq!(
-        state.pg_list(&scoped, "host", 50, None).await.unwrap()["items"]
+        state
+            .pg_list(&scoped, "host", 50, None, None)
+            .await
+            .unwrap()["items"]
             .as_array()
             .unwrap()
             .len(),
@@ -192,7 +217,10 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     );
     scoped.host_group_id = Some(Uuid::parse_str(group["id"].as_str().unwrap()).unwrap());
     assert_eq!(
-        state.pg_list(&scoped, "host", 50, None).await.unwrap()["items"]
+        state
+            .pg_list(&scoped, "host", 50, None, None)
+            .await
+            .unwrap()["items"]
             .as_array()
             .unwrap()
             .len(),
@@ -343,6 +371,297 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
 }
 
 #[tokio::test]
+async fn api_postgres_reconciles_template_triggers_and_validates_host_names() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+        .bind(tenant)
+        .bind(format!("reconcile-test-{tenant}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let principal = Principal {
+        user_id: Uuid::new_v4(),
+        tenant_id: tenant,
+        email: format!("{tenant}@example.test"),
+        role: "owner".into(),
+        host_group_id: None,
+    };
+    let dir = std::env::temp_dir().join(format!("kestrel-api-reconcile-{tenant}"));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+    let id = |value: &Value| Uuid::parse_str(value["id"].as_str().unwrap()).unwrap();
+    // Names outside the PromQL label alphabet could never be scoped.
+    for name in ["web 1", "web\"1", ""] {
+        let err = state
+            .pg_insert(&principal, "host", json!({ "name": name }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{name}");
+    }
+    let host = id(&state
+        .pg_insert(&principal, "host", json!({"name":"switch-1.lan"}))
+        .await
+        .unwrap());
+    let err = state
+        .pg_update(&principal, "host", host, json!({"name":"switch 1"}))
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    let template = id(&state
+        .pg_insert(&principal, "template", json!({"name":"SNMP"}))
+        .await
+        .unwrap());
+    let parent = id(&state
+        .pg_insert(&principal, "template", json!({"name":"Base"}))
+        .await
+        .unwrap());
+    let source = id(&state
+        .pg_insert(
+            &principal,
+            "trigger",
+            json!({"name":"down","expression":"snmp_up == 0","template_id":template}),
+        )
+        .await
+        .unwrap());
+    let copies = || async {
+        sqlx::query_as::<_, (String, String, bool, Option<Uuid>)>(
+            "SELECT name,expression,enabled,source_trigger_id FROM triggers WHERE tenant_id=$1 AND host_id=$2 ORDER BY name",
+        )
+        .bind(tenant)
+        .bind(host)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap()
+    };
+    // An agentless host gets copies as soon as it is linked.
+    state
+        .pg_link_template(&principal, host, template)
+        .await
+        .unwrap();
+    assert_eq!(
+        copies().await,
+        vec![("down".into(), "snmp_up == 0".into(), true, Some(source))]
+    );
+    // Renames and edits reach the copy through its source.
+    state
+        .pg_update(
+            &principal,
+            "trigger",
+            source,
+            json!({"name":"unreachable","expression":"snmp_up < 1"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        copies().await,
+        vec![(
+            "unreachable".into(),
+            "snmp_up < 1".into(),
+            true,
+            Some(source)
+        )]
+    );
+    // Inherited triggers materialise when the parent link or trigger appears.
+    state
+        .pg_link_parent(&principal, template, parent)
+        .await
+        .unwrap();
+    let inherited = id(&state
+        .pg_insert(
+            &principal,
+            "trigger",
+            json!({"name":"base","expression":"up == 0","template_id":parent}),
+        )
+        .await
+        .unwrap());
+    assert_eq!(copies().await.len(), 2);
+    assert!(copies()
+        .await
+        .contains(&("base".into(), "up == 0".into(), true, Some(inherited))));
+    // Deleting a source disables its copy and keeps the row for history.
+    state
+        .pg_delete(&principal, "trigger", source)
+        .await
+        .unwrap();
+    assert!(copies()
+        .await
+        .contains(&("unreachable".into(), "snmp_up < 1".into(), false, None)));
+    // Detaching a trigger from its template retires its copies.
+    state
+        .pg_update(
+            &principal,
+            "trigger",
+            inherited,
+            json!({"template_id":null}),
+        )
+        .await
+        .unwrap();
+    assert!(copies()
+        .await
+        .contains(&("base".into(), "up == 0".into(), false, Some(inherited))));
+    state
+        .pg_update(&principal, "host", host, json!({"name":"switch-2.lan"}))
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn api_postgres_users_have_unique_emails_delete_cleanly_and_grants_revoke() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let parent = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for id in [parent, other] {
+        sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+            .bind(id)
+            .bind(format!("identity-test-{id}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let email = format!("owner-{parent}@example.test");
+    let owner = db
+        .insert_user(
+            &crate::db::TenantId(parent),
+            crate::db::NewUser {
+                email: email.clone(),
+                password_hash: crate::passwords::hash_password("password-test").unwrap(),
+                role: "owner".into(),
+                host_group_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let principal = Principal {
+        user_id: owner.id,
+        tenant_id: parent,
+        email: email.clone(),
+        role: "owner".into(),
+        host_group_id: None,
+    };
+    let other_principal = Principal {
+        tenant_id: other,
+        user_id: Uuid::new_v4(),
+        ..principal.clone()
+    };
+    let dir = std::env::temp_dir().join(format!("kestrel-api-identity-{parent}"));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+
+    // One tenant cannot hold the same address twice, in any letter case.
+    let err = state
+        .pg_insert(
+            &principal,
+            "user",
+            json!({"email":email.to_uppercase(),"password":"password-test","role":"viewer"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::CONFLICT);
+    session_for(&state, &email.to_uppercase(), "password-test", None).await;
+
+    // A user who has signed in (session and audit rows) can be deleted.
+    let member_email = format!("member-{parent}@example.test");
+    let member = state
+        .pg_insert(
+            &principal,
+            "user",
+            json!({"email":member_email,"password":"password-test","role":"admin"}),
+        )
+        .await
+        .unwrap();
+    let member_id = Uuid::parse_str(member["id"].as_str().unwrap()).unwrap();
+    session_for(&state, &member_email, "password-test", None).await;
+    let member_principal = Principal {
+        user_id: member_id,
+        role: "admin".into(),
+        ..principal.clone()
+    };
+    state
+        .pg_insert(&member_principal, "token", json!({"name":"member"}))
+        .await
+        .unwrap();
+    state
+        .pg_delete(&principal, "user", member_id)
+        .await
+        .unwrap();
+    let audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND user_id IS NULL")
+            .bind(parent)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert!(audits >= 1, "audit history must survive user deletion");
+
+    // Revoking a grant ends sessions that were switched into the child.
+    let child = state
+        .pg_create_tenant(
+            &principal,
+            json!({"name":format!("identity-child-{parent}")}),
+        )
+        .await
+        .unwrap();
+    let child_id = Uuid::parse_str(child["id"].as_str().unwrap()).unwrap();
+    let grants = state.pg_grants(&principal).await.unwrap();
+    assert!(grants["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|grant| grant["user_id"] == json!(owner.id) && grant["tenant_id"] == json!(child_id)));
+    assert!(state.pg_grants(&other_principal).await.unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let session = session_for(&state, &email, "password-test", None).await;
+    state
+        .pg_switch(&principal, &session, child_id)
+        .await
+        .unwrap();
+    assert!(state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .is_some());
+    let err = state
+        .pg_revoke_grant(&other_principal, owner.id, child_id)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::FORBIDDEN);
+    state
+        .pg_revoke_grant(&principal, owner.id, child_id)
+        .await
+        .unwrap();
+    assert!(state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .is_none());
+    let err = state
+        .pg_revoke_grant(&principal, owner.id, child_id)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn api_postgres_login_selects_a_tenant_and_audits_failures() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
         return;
@@ -483,134 +802,4 @@ async fn api_postgres_login_selects_a_tenant_and_audits_failures() {
     .await
     .unwrap();
     session_for(&state, &solo, "solo-password", None).await;
-}
-
-#[tokio::test]
-async fn api_postgres_revokes_grants_and_deletes_users_with_history() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        return;
-    };
-    let db = crate::db::Db::connect(&url).await.unwrap();
-    let tenant = Uuid::new_v4();
-    sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
-        .bind(tenant)
-        .bind(format!("offboard-{tenant}"))
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let mut users = Vec::new();
-    for (name, role) in [("owner", "owner"), ("leaver", "operator")] {
-        let email = format!("{name}-{tenant}@example.test");
-        let user = db
-            .insert_user(
-                &crate::db::TenantId(tenant),
-                crate::db::NewUser {
-                    email: email.clone(),
-                    password_hash: crate::passwords::hash_password("password-test").unwrap(),
-                    role: role.into(),
-                    host_group_id: None,
-                },
-            )
-            .await
-            .unwrap();
-        users.push((user.id, email, role));
-    }
-    let owner = Principal {
-        user_id: users[0].0,
-        tenant_id: tenant,
-        email: users[0].1.clone(),
-        role: "owner".into(),
-        host_group_id: None,
-    };
-    let leaver = users[1].0;
-    let dir = std::env::temp_dir().join(format!("kestrel-api-pg-offboard-{tenant}"));
-    let secrets =
-        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
-    let state = ApiState::new(
-        Arc::new(MemoryCatalog::new()),
-        Arc::new(crate::MemoryStore::new()),
-    )
-    .with_database(db.clone(), secrets);
-    let session = session_for(&state, &users[1].1, "password-test", None).await;
-    let child = state
-        .pg_create_tenant(&owner, json!({"name":format!("offboard-child-{tenant}")}))
-        .await
-        .unwrap();
-    let child = Uuid::parse_str(child["id"].as_str().unwrap()).unwrap();
-    state
-        .pg_grant(&owner, leaver, child, "viewer")
-        .await
-        .unwrap();
-    let leaver_principal = state
-        .pg_principal(Some(&session), None)
-        .await
-        .unwrap()
-        .unwrap();
-    state
-        .pg_switch(&leaver_principal, &session, child)
-        .await
-        .unwrap();
-    let switched = state
-        .pg_principal(Some(&session), None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(switched.tenant_id, child);
-
-    let listed = state.pg_grants(&owner).await.unwrap();
-    assert_eq!(listed["items"][0]["user_id"], json!(leaver));
-    assert_eq!(listed["items"][0]["role"], "viewer");
-    // Another tenant's owner cannot revoke it.
-    let stranger = Principal {
-        tenant_id: Uuid::new_v4(),
-        ..owner.clone()
-    };
-    assert!(state.pg_revoke(&stranger, leaver, child).await.is_err());
-    state.pg_revoke(&owner, leaver, child).await.unwrap();
-    assert!(state.pg_revoke(&owner, leaver, child).await.is_err());
-    let back_home = state
-        .pg_principal(Some(&session), None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(back_home.tenant_id, tenant);
-    assert!(state.pg_switch(&back_home, &session, child).await.is_err());
-
-    // Delete a user who has signed in, holds a token, a grant and audit rows.
-    state
-        .pg_grant(&owner, leaver, child, "viewer")
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO api_tokens (tenant_id,user_id,name,token_hash) VALUES ($1,$2,'ci',$3)",
-    )
-    .bind(tenant)
-    .bind(leaver)
-    .bind(format!("hash-{leaver}"))
-    .execute(&db.pool)
-    .await
-    .unwrap();
-    state.pg_delete(&owner, "user", leaver).await.unwrap();
-    assert!(state
-        .pg_principal(Some(&session), None)
-        .await
-        .unwrap()
-        .is_none());
-    let left: (i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM sessions WHERE user_id=$1),(SELECT count(*) FROM api_tokens WHERE user_id=$1),(SELECT count(*) FROM msp_grants WHERE user_id=$1)",
-    )
-    .bind(leaver)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(left, (0, 0, 0));
-    let history: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND action='session.login' AND user_id IS NULL AND target=$2",
-    )
-    .bind(tenant)
-    .bind(leaver.to_string())
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(history, 1, "the sign-in stays in the audit log");
 }

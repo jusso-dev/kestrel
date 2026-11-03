@@ -155,7 +155,7 @@ jobs:
           for _ in $(seq 60); do sudo test -f /var/lib/kestrel/agent.crt && break; sleep 1; done
           sudo test -f /var/lib/kestrel/agent.crt
           systemctl is-active kestrel-agent
-          test "$(stat -c '%U:%G %a' /etc/kestrel/agent.toml)" = "root:kestrel 640"
+          test "$(sudo stat -c '%U:%G %a' /etc/kestrel/agent.toml)" = "root:kestrel 640"
           test "$(sudo stat -c '%U %a' /var/lib/kestrel/agent.key)" = "kestrel 600"
           sudo systemctl stop kestrel-agent
           test "$(systemctl show -p Result --value kestrel-agent)" = success

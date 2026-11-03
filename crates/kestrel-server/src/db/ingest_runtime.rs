@@ -7,6 +7,55 @@ use crate::{
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+/// Prefix of enrolment errors that map to HTTP 409.
+pub(crate) const HOST_CONFLICT: &str = "enrolment host conflict";
+
+/// The existing host named `hostname`, if `agent` may bind to it.
+///
+/// Host names are unique per tenant, so a name that is already taken can only
+/// be bound when the host sits in the token's group (if it has one) and no
+/// other agent is active on it. Otherwise enrolment is refused rather than
+/// taking over another host's identity.
+async fn bindable_host(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: Uuid,
+    hostname: &str,
+    group: Option<Uuid>,
+    agent: Uuid,
+) -> Result<Option<Uuid>, ServerError> {
+    let existing: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
+        "SELECT id,host_group_id FROM hosts WHERE tenant_id=$1 AND name=$2 FOR UPDATE",
+    )
+    .bind(tenant)
+    .bind(hostname)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    let Some((host, host_group)) = existing else {
+        return Ok(None);
+    };
+    if group.is_some() && host_group != group {
+        return Err(ServerError::new(format!(
+            "{HOST_CONFLICT}: host {hostname} is outside the token's host group"
+        )));
+    }
+    let active: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE tenant_id=$1 AND host_id=$2 AND id<>$3 AND revoked_at IS NULL)",
+    )
+    .bind(tenant)
+    .bind(host)
+    .bind(agent)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    if active {
+        return Err(ServerError::new(format!(
+            "{HOST_CONFLICT}: host {hostname} already has an active agent; revoke it first"
+        )));
+    }
+    Ok(Some(host))
+}
+
 impl Db {
     async fn apply_inventory(
         &self,
@@ -103,30 +152,61 @@ impl Db {
         }
         Ok(())
     }
+    /// Resolve an enrolment token's host group, given by id or name.
+    async fn enrolment_group(
+        &self,
+        tenant: Uuid,
+        group: Option<&str>,
+    ) -> Result<Option<Uuid>, ServerError> {
+        let Some(value) = group else {
+            return Ok(None);
+        };
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM host_groups WHERE tenant_id=$1 AND (id::text=$2 OR name=$2)",
+        )
+        .bind(tenant)
+        .bind(value)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| ServerError::new("unknown enrolment host group"))
+        .map(Some)
+    }
+
+    /// Refuse an enrolment that would take over an existing host it may not bind.
+    pub(crate) async fn check_enrolment_host(
+        &self,
+        tenant: Uuid,
+        hostname: &str,
+        group: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let group = self.enrolment_group(tenant, group).await?;
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        bindable_host(&mut tx, tenant, hostname, group, Uuid::nil()).await?;
+        Ok(())
+    }
+
     /// Reconcile the durable certificate directory with the SQL host inventory.
     /// Repeated calls retain host identity and sequence acknowledgement.
     pub(crate) async fn ensure_enrolled_agent(
         &self,
         agent: &EnrolledAgent,
     ) -> Result<Uuid, ServerError> {
-        let existing:Option<Uuid>=sqlx::query_scalar("SELECT host_id FROM agents WHERE tenant_id=$1 AND id=$2 AND cert_serial=$3 AND revoked_at IS NULL AND host_id IS NOT NULL").bind(agent.tenant_id).bind(agent.id).bind(&agent.cert_serial).fetch_optional(&self.pool).await.map_err(db_err)?;
-        if let Some(host) = existing {
+        // An established binding survives certificate renewal and later host
+        // group moves; enrolment group rules apply only when first binding.
+        let existing: Option<(Uuid, String)> = sqlx::query_as("SELECT host_id,cert_serial FROM agents WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL AND host_id IS NOT NULL").bind(agent.tenant_id).bind(agent.id).fetch_optional(&self.pool).await.map_err(db_err)?;
+        if let Some((host, serial)) = existing {
+            if serial != agent.cert_serial {
+                let expires = DateTime::parse_from_rfc3339(&agent.cert_not_after)
+                    .map_err(|_| ServerError::new("invalid certificate expiry"))?
+                    .with_timezone(&Utc);
+                sqlx::query("UPDATE agents SET cert_serial=$3,cert_not_after=$4 WHERE tenant_id=$1 AND id=$2 AND revoked_at IS NULL").bind(agent.tenant_id).bind(agent.id).bind(&agent.cert_serial).bind(expires).execute(&self.pool).await.map_err(db_err)?;
+            }
             return Ok(host);
         }
-        let group = match &agent.host_group_id {
-            Some(value) => Some(
-                sqlx::query_scalar::<_, Uuid>(
-                    "SELECT id FROM host_groups WHERE tenant_id=$1 AND (id::text=$2 OR name=$2)",
-                )
-                .bind(agent.tenant_id)
-                .bind(value)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?
-                .ok_or_else(|| ServerError::new("unknown enrolment host group"))?,
-            ),
-            None => None,
-        };
+        let group = self
+            .enrolment_group(agent.tenant_id, agent.host_group_id.as_deref())
+            .await?;
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let quota: i32 =
             sqlx::query_scalar("SELECT host_quota FROM tenants WHERE id=$1 FOR UPDATE")
@@ -134,13 +214,8 @@ impl Db {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
-        let existing: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM hosts WHERE tenant_id=$1 AND name=$2")
-                .bind(agent.tenant_id)
-                .bind(&agent.hostname)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?;
+        let existing =
+            bindable_host(&mut tx, agent.tenant_id, &agent.hostname, group, agent.id).await?;
         let host = if let Some(host) = existing {
             host
         } else {
@@ -202,7 +277,10 @@ impl Db {
             .collect::<BTreeMap<_, _>>();
         // Materialise per-host trigger definitions. The evaluator can now scope
         // the shared template expression to this host without alerting twice.
-        sqlx::query("WITH RECURSIVE linked(id) AS (SELECT template_id FROM template_links WHERE tenant_id=$1 AND host_id=$2 UNION SELECT p.parent_id FROM template_parents p JOIN linked l ON p.template_id=l.id WHERE p.tenant_id=$1) INSERT INTO triggers (tenant_id,host_id,template_id,name,expression,severity,for_seconds,recovery_expr,labels,interval_s,recover_for) SELECT t.tenant_id,$2,t.template_id,t.name,t.expression,t.severity,t.for_seconds,t.recovery_expr,t.labels,t.interval_s,t.recover_for FROM triggers t JOIN linked l ON l.id=t.template_id WHERE t.tenant_id=$1 AND t.host_id IS NULL ON CONFLICT (tenant_id,host_id,template_id,name) WHERE host_id IS NOT NULL AND template_id IS NOT NULL DO UPDATE SET expression=EXCLUDED.expression,severity=EXCLUDED.severity,for_seconds=EXCLUDED.for_seconds,recovery_expr=EXCLUDED.recovery_expr,interval_s=EXCLUDED.interval_s,recover_for=EXCLUDED.recover_for").bind(tenant).bind(host).execute(&self.pool).await.map_err(db_err)?;
+        let mut conn = self.pool.acquire().await.map_err(db_err)?;
+        super::reconcile_template_triggers(&mut conn, tenant, Some(host))
+            .await
+            .map_err(db_err)?;
         Ok(compile_agent_config(
             &HostView { name, overrides },
             &[TemplateDoc {
@@ -281,7 +359,11 @@ impl Db {
                 .succ_opt()
                 .ok_or_else(|| ServerError::new("invalid log date"))?;
             let partition = crate::ingest::log_partition_name(now.timestamp_millis());
-            sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {partition} PARTITION OF log_events FOR VALUES FROM ('{date}') TO ('{next}')")).execute(&mut *tx).await.map_err(db_err)?;
+            // Bounds are UTC whatever the session time zone, and rows carry the
+            // same `now` as created_at. Otherwise database clock skew around
+            // midnight files rows into log_events_default, and the next day's
+            // partition cannot be created while it holds them.
+            sqlx::query(&format!("CREATE TABLE IF NOT EXISTS {partition} PARTITION OF log_events FOR VALUES FROM ('{date} 00:00:00+00') TO ('{next} 00:00:00+00')")).execute(&mut *tx).await.map_err(db_err)?;
             for log in batch.logs {
                 let observed = DateTime::from_timestamp_millis(log.timestamp_ms)
                     .ok_or_else(|| ServerError::new("invalid log timestamp"))?;
@@ -290,13 +372,32 @@ impl Db {
                     .into_iter()
                     .map(|label| (label.name, serde_json::Value::String(label.value)))
                     .collect::<serde_json::Map<_, _>>();
-                sqlx::query("INSERT INTO log_events (tenant_id,host_id,agent_id,source,line,labels,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)").bind(tenant).bind(host).bind(agent).bind(log.source).bind(log.line).bind(serde_json::Value::Object(labels)).bind(observed).execute(&mut *tx).await.map_err(db_err)?;
+                sqlx::query("INSERT INTO log_events (tenant_id,host_id,agent_id,source,line,labels,observed_at,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)").bind(tenant).bind(host).bind(agent).bind(log.source).bind(log.line).bind(serde_json::Value::Object(labels)).bind(observed).bind(now).execute(&mut *tx).await.map_err(db_err)?;
             }
             sqlx::query("DELETE FROM log_events WHERE created_at < now()-make_interval(days=>$1)")
                 .bind(self.log_retention_days)
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
+            // Drop whole daily partitions once they age out; the DELETE above
+            // only empties them. Names come from the catalogue and must parse
+            // as a partition date to qualify.
+            let partitions: Vec<String> = sqlx::query_scalar("SELECT c.relname::text FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='log_events'::regclass")
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            for name in partitions {
+                if crate::ingest::partition_is_expired(
+                    &name,
+                    &partition,
+                    i64::from(self.log_retention_days),
+                ) {
+                    sqlx::query(&format!("DROP TABLE IF EXISTS \"{name}\""))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(db_err)?;
+                }
+            }
         }
         if let Some(inventory) = batch.inventory {
             self.apply_inventory(&mut tx, tenant, host, &inventory)
@@ -352,6 +453,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enrolment_does_not_take_over_hosts_outside_group_or_with_active_agents() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let db = Db::connect(&url).await.unwrap();
+        let tenant = Uuid::new_v4();
+        sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+            .bind(tenant)
+            .bind(format!("enrol-{tenant}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO host_groups (tenant_id,name) VALUES ($1,'branch')")
+            .bind(tenant)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let agent = |group: Option<&str>| EnrolledAgent {
+            id: Uuid::new_v4(),
+            tenant_id: tenant,
+            hostname: "web".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            cert_serial: "abc".into(),
+            cert_not_after: "2030-01-01T00:00:00Z".into(),
+            host_group_id: group.map(str::to_string),
+        };
+        let first = agent(None);
+        let host = db.ensure_enrolled_agent(&first).await.unwrap();
+        let second = agent(None);
+        let err = db.ensure_enrolled_agent(&second).await.unwrap_err();
+        assert!(err.to_string().starts_with(HOST_CONFLICT), "{err}");
+        assert!(db.check_enrolment_host(tenant, "web", None).await.is_err());
+        sqlx::query("UPDATE agents SET revoked_at=now() WHERE id=$1")
+            .bind(first.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let grouped = agent(Some("branch"));
+        let err = db.ensure_enrolled_agent(&grouped).await.unwrap_err();
+        assert!(err.to_string().contains("host group"), "{err}");
+        assert!(db
+            .check_enrolment_host(tenant, "web", Some("branch"))
+            .await
+            .is_err());
+        db.check_enrolment_host(tenant, "web", None).await.unwrap();
+        assert_eq!(db.ensure_enrolled_agent(&second).await.unwrap(), host);
+        let names: i64 = sqlx::query_scalar("SELECT count(*) FROM hosts WHERE tenant_id=$1")
+            .bind(tenant)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(names, 1);
+
+        // Renewal keeps an established binding after the host changes group.
+        let mut branch = agent(Some("branch"));
+        branch.hostname = "db".into();
+        let db_host = db.ensure_enrolled_agent(&branch).await.unwrap();
+        sqlx::query("UPDATE hosts SET host_group_id=NULL WHERE id=$1")
+            .bind(db_host)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let renewed = EnrolledAgent {
+            cert_serial: "def".into(),
+            ..branch.clone()
+        };
+        assert_eq!(db.ensure_enrolled_agent(&renewed).await.unwrap(), db_host);
+        let serial: String = sqlx::query_scalar("SELECT cert_serial FROM agents WHERE id=$1")
+            .bind(branch.id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(serial, "def");
+    }
+
+    #[tokio::test]
     async fn ingest_postgres_retries_without_acknowledging_and_discovers_entities() {
         let Ok(url) = std::env::var("DATABASE_URL") else {
             return;
@@ -375,6 +553,11 @@ mod tests {
             host_group_id: None,
         };
         let host = db.ensure_enrolled_agent(&agent).await.unwrap();
+        // An aged-out daily partition is dropped by the next log ingest.
+        sqlx::query("CREATE TABLE IF NOT EXISTS log_events_2000_01_01 PARTITION OF log_events FOR VALUES FROM ('2000-01-01 00:00:00+00') TO ('2000-01-02 00:00:00+00')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let template: Uuid = sqlx::query_scalar(
             "INSERT INTO templates (tenant_id,name) VALUES ($1,'Disks') RETURNING id",
         )
@@ -462,6 +645,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(logs, 1);
+        let partition = crate::ingest::log_partition_name(Utc::now().timestamp_millis());
+        let partitioned: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {partition} WHERE tenant_id=$1"
+        ))
+        .bind(tenant)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            partitioned, 1,
+            "rows must land in the partition named for them"
+        );
+        let expired: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('log_events_2000_01_01')::text")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(expired.is_none(), "expired partitions must be dropped");
         let entities: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM discovered_entities WHERE tenant_id=$1 AND rule_id=$2",
         )

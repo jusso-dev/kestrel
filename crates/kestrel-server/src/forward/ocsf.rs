@@ -46,6 +46,9 @@ pub fn api_activity(action: &str, actor: &str, operation: &str) -> Value {
     } else {
         (1, "Create")
     };
+    // Refused actions, such as a wrong password, are recorded as failures so
+    // SIEM rules that look for failed authentication see them.
+    let failed = action.ends_with("_failed");
     json!({
         "class_uid": 6003,
         "class_name": "API Activity",
@@ -62,8 +65,8 @@ pub fn api_activity(action: &str, actor: &str, operation: &str) -> Value {
         "api": { "operation": operation },
         "actor": { "user": { "name": actor, "type": "User" } },
         "src_endpoint": {"name":"unknown"},
-        "status": "Success",
-        "status_id": 1,
+        "status": if failed { "Failure" } else { "Success" },
+        "status_id": if failed { 2 } else { 1 },
         "metadata": {
             "version": "1.1.0",
             "product": { "name": "Kestrel", "vendor_name": "jusso-dev" }
@@ -182,5 +185,19 @@ mod contract_tests {
         let mut invalid = finding;
         invalid["type_uid"] = json!(200402);
         assert!(validate_class(&invalid, 2004).is_err());
+    }
+
+    #[test]
+    fn failed_sign_ins_are_reported_as_failures() {
+        let failed = api_activity(
+            "session.login_failed",
+            "a@example.com",
+            "session.login_failed",
+        );
+        assert_eq!(failed["status"], "Failure");
+        assert_eq!(failed["status_id"], 2);
+        validate_class(&failed, 6003).unwrap();
+        let ok = api_activity("session.login", "a@example.com", "session.login");
+        assert_eq!(ok["status_id"], 1);
     }
 }

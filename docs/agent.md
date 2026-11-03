@@ -62,7 +62,7 @@ allow_remote_commands = true
 plugin_dirs = ["/usr/lib/kestrel/plugins", "/usr/lib/nagios/plugins"]
 ```
 
-The executable's canonical path must remain inside an allowed directory. The agent starts it directly without a shell, enforces timeouts, and retains at most 4 KiB per output stream. Plugin exit states and performance metrics are buffered for delivery. Keep plugin directories writable only by administrators. Remote log specifications are trusted server configuration and can read files accessible to the service account.
+The executable's canonical path must remain inside an allowed directory. The agent starts it directly without a shell, enforces timeouts, and retains at most 4 KiB per output stream. Plugin exit states and performance metrics are buffered for delivery. Keep plugin directories writable only by administrators. Remote log specifications are trusted server configuration and can read files accessible to the service account. Only the Linux systemd unit uses a dedicated `kestrel` user. The macOS launchd daemon runs as root and the Windows service runs as `LocalSystem`, so on those platforms plugins run with full privileges and log specifications can read any file.
 
 HTTP checks and builtin collectors are not shell commands. Linking the Linux template does not enable remote execution.
 

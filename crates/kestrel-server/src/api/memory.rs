@@ -162,7 +162,7 @@ impl MemoryCatalog {
             let mut candidates: Vec<LoginCandidate> = inner
                 .users
                 .iter()
-                .filter(|user| user.email == attempt.email)
+                .filter(|user| user.email.to_lowercase() == attempt.email.to_lowercase())
                 .filter(|user| tenant.is_none_or(|id| user.tenant_id == id))
                 .map(|user| LoginCandidate {
                     user_id: user.id,
@@ -277,9 +277,13 @@ impl MemoryCatalog {
         kind: &str,
         limit: usize,
         cursor: Option<&str>,
+        status: Option<&str>,
     ) -> Value {
         let limit = limit.clamp(1, 200);
         let mut items = self.visible(principal, kind);
+        if let Some(status) = status.filter(|_| kind == "problem") {
+            items.retain(|row| row["status"] == status);
+        }
         if let Some(cursor) = cursor {
             if let Some(pos) = items
                 .iter()
@@ -551,20 +555,12 @@ impl MemoryCatalog {
         if inner.grants.len() == before {
             return false;
         }
-        let home = inner
-            .users
-            .iter()
-            .find(|user| user.id == user_id)
-            .map(|user| user.tenant_id);
-        if let Some(home) = home {
-            for session in inner.sessions.values_mut() {
-                if session.user_id == user_id && session.tenant_id == tenant_id {
-                    session.tenant_id = home;
-                }
-            }
-        }
+        // Sessions switched into the tenant end, as in PostgreSQL.
+        inner
+            .sessions
+            .retain(|_, session| !(session.user_id == user_id && session.tenant_id == tenant_id));
         drop(inner);
-        self.audit(principal, "grant.delete", &format!("{tenant_id}:{user_id}"));
+        self.audit(principal, "grant.delete", &tenant_id.to_string());
         true
     }
 

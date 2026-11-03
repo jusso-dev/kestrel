@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 fn database_error(error: sqlx::Error) -> ApiError {
     if let sqlx::Error::Database(ref database) = error {
+        if database.constraint() == Some("users_tenant_email_lower_key") {
+            return fail(StatusCode::CONFLICT, "email address is already in use");
+        }
         if database.is_unique_violation() {
             return fail(StatusCode::CONFLICT, "resource already exists");
         }
@@ -84,9 +87,16 @@ fn public(mut value: Value) -> Value {
     value
 }
 
+/// A template trigger is a definition only; hosts evaluate materialised copies.
+fn template_level(trigger: &Value) -> bool {
+    !trigger["template_id"].is_null() && trigger["host_id"].is_null()
+}
+
 fn projection(kind: &str) -> &'static str {
     if kind == "host" {
         "to_jsonb(r) || jsonb_build_object('status',CASE WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.revoked_at IS NULL AND a.last_seen_at>now()-interval '180 seconds') THEN 'up' WHEN EXISTS (SELECT 1 FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id AND a.last_seen_at IS NOT NULL) THEN 'down' ELSE 'unknown' END,'last_seen_at',(SELECT max(a.last_seen_at) FROM agents a WHERE a.tenant_id=r.tenant_id AND a.host_id=r.id))"
+    } else if kind == "problem" {
+        "to_jsonb(r) || jsonb_build_object('name',concat_ws(' on ',(SELECT t.name FROM triggers t WHERE t.tenant_id=r.tenant_id AND t.id=r.trigger_id),(SELECT h.name FROM hosts h WHERE h.tenant_id=r.tenant_id AND h.id=r.host_id)))"
     } else {
         "to_jsonb(r)"
     }
@@ -148,6 +158,9 @@ impl ApiState {
             ));
         }
         sqlx::query("INSERT INTO template_parents (tenant_id,template_id,parent_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(principal.tenant_id).bind(template).bind(parent).execute(&mut *tx).await.map_err(database_error)?;
+        crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+            .await
+            .map_err(database_error)?;
         audit(&mut tx, principal, "template.parent", &template.to_string()).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(json!({"template_id":template,"parent_id":parent}))
@@ -170,6 +183,14 @@ impl ApiState {
         values: &Value,
     ) -> Result<(), ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
+        // Host names become PromQL label values; trigger scoping rejects
+        // anything else, so such a host could never alert.
+        if kind == "host" && !values["name"].as_str().is_some_and(crate::promql::label_ok) {
+            return Err(fail(
+                StatusCode::BAD_REQUEST,
+                "host name may only contain letters, digits, '-', '_', '.' and ':'",
+            ));
+        }
         if kind == "discovery_rule" {
             if !matches!(
                 values["entity"].as_str(),
@@ -377,22 +398,23 @@ impl ApiState {
         let db = self.db.as_ref().expect("PostgreSQL state");
         let tenant = match attempt.tenant {
             Some(tenant) => {
-                let id: Option<Uuid> = match Uuid::parse_str(tenant) {
-                    Ok(id) => sqlx::query_scalar("SELECT id FROM tenants WHERE id=$1")
-                        .bind(id)
-                        .fetch_optional(&db.pool)
-                        .await
-                        .map_err(database_error)?,
-                    Err(_) => sqlx::query_scalar("SELECT id FROM tenants WHERE name=$1")
-                        .bind(tenant)
-                        .fetch_optional(&db.pool)
-                        .await
-                        .map_err(database_error)?,
-                };
+                // A UUID-shaped value matches a tenant id first, then a name.
+                let id: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM tenants WHERE id::text=lower($1) OR name=$1 ORDER BY (id::text=lower($1)) DESC LIMIT 1",
+                )
+                .bind(tenant)
+                .fetch_optional(&db.pool)
+                .await
+                .map_err(database_error)?;
                 match id {
                     Some(id) => Some(id),
                     None => {
-                        verify_off_runtime(attempt.password.to_string(), Vec::new()).await?;
+                        verify_off_runtime(
+                            &self.login_guard,
+                            attempt.password.to_string(),
+                            Vec::new(),
+                        )
+                        .await?;
                         return Ok(LoginOutcome::Refused);
                     }
                 }
@@ -401,7 +423,7 @@ impl ApiState {
         };
         let rows: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(
             "SELECT u.id,u.tenant_id,t.name,u.password_hash FROM users u JOIN tenants t ON t.id=u.tenant_id \
-             WHERE u.email=$1 AND ($2::uuid IS NULL OR u.tenant_id=$2) ORDER BY t.name,u.id LIMIT $3",
+             WHERE lower(u.email)=lower($1) AND ($2::uuid IS NULL OR u.tenant_id=$2) ORDER BY t.name,u.id LIMIT $3",
         )
         .bind(attempt.email)
         .bind(tenant)
@@ -421,7 +443,7 @@ impl ApiState {
             )
             .collect();
         let (candidates, decision) =
-            verify_off_runtime(attempt.password.to_string(), candidates).await?;
+            verify_off_runtime(&self.login_guard, attempt.password.to_string(), candidates).await?;
         let detail = json!({ "email": attempt.email, "source": attempt.source });
         let user = match decision {
             LoginDecision::Accept(index) => &candidates[index],
@@ -521,6 +543,7 @@ impl ApiState {
         kind: &str,
         limit: usize,
         cursor: Option<&str>,
+        status: Option<&str>,
     ) -> Result<Value, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
         if kind == "tenant" {
@@ -534,15 +557,23 @@ impl ApiState {
             .map_err(|_| fail(StatusCode::BAD_REQUEST, "invalid cursor"))?;
         let limit = limit.clamp(1, 200);
         let projection = projection(kind);
-        let sql=format!("SELECT {projection} FROM {table} r WHERE r.tenant_id=$1 AND ({scope}) AND ($2::uuid IS NULL OR TRUE) AND ($3::uuid IS NULL OR r.id > $3) ORDER BY r.id LIMIT $4");
-        let mut rows: Vec<Value> = sqlx::query_scalar(&sql)
+        // Only problems expose a status filter; other tables may lack the column.
+        let status = status.filter(|_| kind == "problem");
+        let filter = if status.is_some() {
+            " AND r.status = $5"
+        } else {
+            ""
+        };
+        let sql=format!("SELECT {projection} FROM {table} r WHERE r.tenant_id=$1 AND ({scope}) AND ($2::uuid IS NULL OR TRUE) AND ($3::uuid IS NULL OR r.id > $3){filter} ORDER BY r.id LIMIT $4");
+        let mut query = sqlx::query_scalar(&sql)
             .bind(principal.tenant_id)
             .bind(group)
             .bind(cursor)
-            .bind((limit + 1) as i64)
-            .fetch_all(&db.pool)
-            .await
-            .map_err(database_error)?;
+            .bind((limit + 1) as i64);
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        let mut rows: Vec<Value> = query.fetch_all(&db.pool).await.map_err(database_error)?;
         let next = if rows.len() > limit {
             rows[limit - 1]["id"].clone()
         } else {
@@ -725,6 +756,11 @@ impl ApiState {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
+        if kind == "trigger" && template_level(&row) {
+            crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,
@@ -844,7 +880,7 @@ impl ApiState {
 
     pub(super) async fn pg_overview(&self, principal: &Principal) -> Result<Value, ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
-        let rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',t.id,'tenant_id',t.id,'name',t.name,'parent_id',t.parent_id,'problem_count',(SELECT count(*) FROM problems p WHERE p.tenant_id=t.id AND p.status='problem' AND (t.id<>u.tenant_id OR u.role IN ('owner','admin') OR u.host_group_id IS NULL OR EXISTS (SELECT 1 FROM hosts h WHERE h.tenant_id=p.tenant_id AND h.id=p.host_id AND h.host_group_id=u.host_group_id)))) FROM tenants t JOIN users u ON u.id=$1 WHERE EXISTS (SELECT 1 FROM msp_grants g WHERE g.tenant_id=t.id AND g.user_id=u.id) OR t.id=u.tenant_id ORDER BY t.name").bind(principal.user_id).fetch_all(&db.pool).await.map_err(database_error)?;
+        let rows:Vec<Value>=sqlx::query_scalar("SELECT jsonb_build_object('id',t.id,'tenant_id',t.id,'name',t.name,'parent_id',t.parent_id,'active',t.id=$2,'problem_count',(SELECT count(*) FROM problems p WHERE p.tenant_id=t.id AND p.status='problem' AND (t.id<>u.tenant_id OR u.role IN ('owner','admin') OR u.host_group_id IS NULL OR EXISTS (SELECT 1 FROM hosts h WHERE h.tenant_id=p.tenant_id AND h.id=p.host_id AND h.host_group_id=u.host_group_id)))) FROM tenants t JOIN users u ON u.id=$1 WHERE EXISTS (SELECT 1 FROM msp_grants g WHERE g.tenant_id=t.id AND g.user_id=u.id) OR t.id=u.tenant_id ORDER BY t.name").bind(principal.user_id).bind(principal.tenant_id).fetch_all(&db.pool).await.map_err(database_error)?;
         Ok(json!({"items":rows}))
     }
 
@@ -894,9 +930,8 @@ impl ApiState {
         Ok(json!({ "items": rows }))
     }
 
-    /// Remove a grant into a direct child tenant and move any session that
-    /// switched into it back to the user's home tenant.
-    pub(super) async fn pg_revoke(
+    /// Revoke an MSP grant and end the user's sessions in that tenant.
+    pub(super) async fn pg_revoke_grant(
         &self,
         principal: &Principal,
         user: Uuid,
@@ -904,31 +939,27 @@ impl ApiState {
     ) -> Result<(), ApiError> {
         let db = self.db.as_ref().expect("PostgreSQL state");
         let mut tx = db.pool.begin().await.map_err(database_error)?;
-        let removed = sqlx::query(
-            "DELETE FROM msp_grants g USING tenants t WHERE g.tenant_id=t.id AND t.id=$1 AND t.parent_id=$2 AND g.user_id=$3",
-        )
-        .bind(target)
-        .bind(principal.tenant_id)
-        .bind(user)
-        .execute(&mut *tx)
-        .await
-        .map_err(database_error)?;
+        // Same authority as granting: a direct child and a user of this tenant.
+        let allowed:bool=sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants t JOIN users u ON u.tenant_id=t.parent_id WHERE t.id=$1 AND t.parent_id=$2 AND u.id=$3)").bind(target).bind(principal.tenant_id).bind(user).fetch_one(&mut *tx).await.map_err(database_error)?;
+        if !allowed {
+            return Err(fail(StatusCode::FORBIDDEN, "not allowed"));
+        }
+        let removed = sqlx::query("DELETE FROM msp_grants WHERE tenant_id=$1 AND user_id=$2")
+            .bind(target)
+            .bind(user)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
         if removed.rows_affected() == 0 {
             return Err(fail(StatusCode::NOT_FOUND, "not found"));
         }
-        sqlx::query("UPDATE sessions SET active_tenant_id=tenant_id WHERE user_id=$1 AND active_tenant_id=$2")
+        sqlx::query("DELETE FROM sessions WHERE user_id=$1 AND active_tenant_id=$2")
             .bind(user)
             .bind(target)
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
-        audit(
-            &mut tx,
-            principal,
-            "grant.delete",
-            &format!("{target}:{user}"),
-        )
-        .await?;
+        audit(&mut tx, principal, "grant.delete", &target.to_string()).await?;
         tx.commit().await.map_err(database_error)
     }
 
@@ -943,6 +974,10 @@ impl ApiState {
         let db = self.db.as_ref().expect("PostgreSQL state");
         let mut tx = db.pool.begin().await.map_err(database_error)?;
         sqlx::query("INSERT INTO template_links (tenant_id,host_id,template_id) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING").bind(principal.tenant_id).bind(host).bind(template).execute(&mut *tx).await.map_err(database_error)?;
+        // Agentless hosts never fetch agent configuration, so materialise now.
+        crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, Some(host))
+            .await
+            .map_err(database_error)?;
         audit(&mut tx, principal, "template.link", &host.to_string()).await?;
         tx.commit().await.map_err(database_error)?;
         Ok(json!({"host_id":host,"template_id":template}))
@@ -1022,6 +1057,7 @@ impl ApiState {
             .await
             .map_err(database_error)?
             .ok_or_else(|| fail(StatusCode::NOT_FOUND, "not found"))?;
+        let was_template_level = kind == "trigger" && template_level(&values);
         if kind == "user"
             && principal.role != "owner"
             && (values["role"] == "owner" || input.get("role").is_some_and(|role| role == "owner"))
@@ -1097,6 +1133,11 @@ impl ApiState {
             .fetch_one(&mut *tx)
             .await
             .map_err(database_error)?;
+        if was_template_level || (kind == "trigger" && template_level(&row)) {
+            crate::db::reconcile_template_triggers(&mut tx, principal.tenant_id, None)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,
@@ -1130,6 +1171,18 @@ impl ApiState {
         let (table, _, _) = resource(kind)?;
         let db = self.db.as_ref().expect("PostgreSQL state");
         let mut tx = db.pool.begin().await.map_err(database_error)?;
+        if kind == "trigger" {
+            // Retire per-host copies; deleting the source only clears their
+            // link, and they keep problem history.
+            sqlx::query(
+                "UPDATE triggers SET enabled=false WHERE tenant_id=$1 AND source_trigger_id=$2",
+            )
+            .bind(principal.tenant_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        }
         let sql = format!("DELETE FROM {table} WHERE tenant_id=$1 AND id=$2");
         sqlx::query(&sql)
             .bind(principal.tenant_id)
@@ -1138,7 +1191,7 @@ impl ApiState {
             .await
             .map_err(database_error)?;
         if kind == "user" {
-            // Grants into other tenants have no foreign key to cascade from.
+            // Grants name users of a parent tenant and carry no foreign key.
             sqlx::query("DELETE FROM msp_grants WHERE user_id=$1")
                 .bind(id)
                 .execute(&mut *tx)
@@ -1231,11 +1284,18 @@ async fn audit_detail(
     Ok(())
 }
 
-/// Argon2 is CPU bound; keep it off the async workers.
+/// Argon2 is CPU bound; keep it off the async workers and bound how many run
+/// at once so a burst of sign-ins cannot exhaust the blocking pool.
 async fn verify_off_runtime(
+    guard: &crate::login_guard::LoginGuard,
     password: String,
     candidates: Vec<LoginCandidate>,
 ) -> Result<(Vec<LoginCandidate>, LoginDecision), ApiError> {
+    let _permit = guard
+        .verify_permits
+        .acquire()
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "sign-in failed"))?;
     tokio::task::spawn_blocking(move || {
         let decision = decide_login(&password, &candidates);
         (candidates, decision)

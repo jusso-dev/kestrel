@@ -350,7 +350,10 @@ async fn queue_notifications(
         media.sort();
         media.dedup();
         for id in media {
-            sqlx::query("INSERT INTO notification_jobs(tenant_id,problem_id,media_type_id,status,payload,run_after) SELECT $1,$2,id,'pending',$4,now()+make_interval(secs=>$5) FROM media_types WHERE tenant_id=$1 AND id=$3 AND kind NOT IN ('wedgetail','syslog','siem_webhook') ON CONFLICT DO NOTHING").bind(tenant).bind(problem).bind(id).bind(json!({"event":status,"step":if status=="resolved"{0}else{step},"trigger":trigger,"host":host,"value":value,"problem_id":problem})).bind(delay as f64).execute(&mut *conn).await?;
+            // Resolution goes only to targets that actually received the
+            // problem; steps cancelled by resolve or acknowledgement are
+            // marked sent with a last_error and do not count.
+            sqlx::query("INSERT INTO notification_jobs(tenant_id,problem_id,media_type_id,status,payload,run_after) SELECT $1,$2,id,'pending',$4,now()+make_interval(secs=>$5) FROM media_types WHERE tenant_id=$1 AND id=$3 AND kind NOT IN ('wedgetail','syslog','siem_webhook') AND ($6<>'resolved' OR EXISTS(SELECT 1 FROM notification_jobs j WHERE j.tenant_id=$1 AND j.problem_id=$2 AND j.media_type_id=$3 AND j.payload->>'event'='problem' AND j.status='sent' AND j.last_error IS NULL)) ON CONFLICT DO NOTHING").bind(tenant).bind(problem).bind(id).bind(json!({"event":status,"step":if status=="resolved"{0}else{step},"trigger":trigger,"host":host,"value":value,"problem_id":problem})).bind(delay as f64).bind(status).execute(&mut *conn).await?;
         }
     }
     Ok(())
@@ -437,11 +440,15 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
             match kind.as_str() {
                 "wedgetail" => {
                     WedgetailForwarder::new(required(&config, "url")?, required(&config, "token")?)
+                        .with_egress(&state.egress)
+                        .await?
                         .forward(&event)
                         .await?
                 }
                 "siem_webhook" => {
                     WebhookForwarder::new(required(&config, "url")?, required(&config, "secret")?)
+                        .with_egress(&state.egress)
+                        .await?
                         .forward(&event)
                         .await?
                 }
@@ -477,7 +484,9 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
                 )
                 .await??
             } else {
-                notify::HttpNotifier::new().send(&rendered, &config).await?
+                notify::HttpNotifier::guarded(state.egress.clone())
+                    .send(&rendered, &config)
+                    .await?
             }
         }
         Ok(())
@@ -492,6 +501,26 @@ async fn deliver_one(state: &ApiState, public_url: &str, forward: bool) -> Resul
         ),
     };
     sqlx::query(&format!("UPDATE {table} SET status=$3,attempts=$4,last_error=$5,run_after=now()+make_interval(secs=>$6) WHERE tenant_id=$1 AND id=$2")).bind(tenant).bind(id).bind(status).bind(attempts).bind(error).bind(notify::backoff_seconds(attempts) as f64).execute(&mut *tx).await?;
+    if let (Some(problem), "sent") = (problem, status) {
+        if payload["event"] == "problem" {
+            // A resolve that committed while this send was in flight could not
+            // see it as sent and skipped this target. FOR SHARE waits for an
+            // in-flight resolve, so one side always queues the recovery.
+            let current: String = sqlx::query_scalar(
+                "SELECT status FROM problems WHERE tenant_id=$1 AND id=$2 FOR SHARE",
+            )
+            .bind(tenant)
+            .bind(problem)
+            .fetch_one(&mut *tx)
+            .await?;
+            if current == "resolved" {
+                let mut resolved = payload.clone();
+                resolved["event"] = json!("resolved");
+                resolved["step"] = json!(0);
+                sqlx::query("INSERT INTO notification_jobs(tenant_id,problem_id,media_type_id,status,payload,run_after) VALUES($1,$2,$3,'pending',$4,now()) ON CONFLICT DO NOTHING").bind(tenant).bind(problem).bind(media_id).bind(resolved).execute(&mut *tx).await?;
+            }
+        }
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -605,8 +634,14 @@ mod tests {
             sqlx::query("INSERT INTO actions(tenant_id,name,media_type_id) VALUES($1,'page',$2)").bind(tenant).bind(medium).execute(&db.pool).await?;
             // A malformed legacy step must not roll back problem creation.
             sqlx::query("INSERT INTO action_steps(tenant_id,action_id,step,media_type_ids) SELECT tenant_id,id,0,$2 FROM actions WHERE tenant_id=$1").bind(tenant).bind(json!(["invalid-legacy-uuid"])).execute(&db.pool).await?;
+            // An escalation step that never fires before resolution.
+            let later=Uuid::new_v4();
+            sqlx::query("INSERT INTO media_types(id,tenant_id,name,kind,config) VALUES($1,$2,'later','webhook',$3)").bind(later).bind(tenant).bind(json!({"url":hook.uri(),"secret":"local-test"})).execute(&db.pool).await?;
+            sqlx::query("INSERT INTO action_steps(tenant_id,action_id,step,delay_s,media_type_ids) SELECT tenant_id,id,1,3600,$2 FROM actions WHERE tenant_id=$1").bind(tenant).bind(json!([later])).execute(&db.pool).await?;
             let signal=Arc::new(Signal{firing:AtomicBool::new(true),tenant,include_host:AtomicBool::new(true),value:AtomicU64::new(95)});
-            let state=ApiState::new(Arc::new(crate::api::MemoryCatalog::new()),signal.clone()).with_database(db.clone(),Arc::new(crate::secrets::SecretBox::load_or_create(&std::env::temp_dir().join(format!("{name}.key")))?));
+            let mut state=ApiState::new(Arc::new(crate::api::MemoryCatalog::new()),signal.clone()).with_database(db.clone(),Arc::new(crate::secrets::SecretBox::load_or_create(&std::env::temp_dir().join(format!("{name}.key")))?));
+            // The webhook fake listens on loopback, which the default policy refuses.
+            state.egress=Arc::new(kestrel_checks::EgressGuard::new(true));
             evaluate(&state).await?;
             let problem:Uuid=sqlx::query_scalar("SELECT id FROM problems WHERE tenant_id=$1").bind(tenant).fetch_one(&db.pool).await?;
             assert!(deliver_one(&state,"https://monitor.example",false).await?);
@@ -623,6 +658,12 @@ mod tests {
             sqlx::query("DELETE FROM trigger_evaluations").execute(&db.pool).await?;
             evaluate(&state).await?;
             let status:String=sqlx::query_scalar("SELECT status FROM problems WHERE id=$1").bind(problem).fetch_one(&db.pool).await?;assert_eq!(status,"resolved");
+            let unsent:i64=sqlx::query_scalar("SELECT count(*) FROM notification_jobs WHERE media_type_id=$1 AND payload->>'event'='resolved'").bind(later).fetch_one(&db.pool).await?;
+            assert_eq!(unsent,0,"targets that never received the problem must not get its resolution");
+            let resolved:i64=sqlx::query_scalar("SELECT count(*) FROM notification_jobs WHERE media_type_id=$1 AND payload->>'event'='resolved'").bind(medium).fetch_one(&db.pool).await?;
+            assert_eq!(resolved,1);
+            sqlx::query("DELETE FROM notification_jobs WHERE payload->>'step'='1'").execute(&db.pool).await?;
+            sqlx::query("DELETE FROM action_steps WHERE step=1").execute(&db.pool).await?;
             assert!(deliver_one(&state,"https://monitor.example",false).await?);
             let requests=hook.received_requests().await.unwrap();assert_eq!(requests.len(),2);
             let resolution:Value=serde_json::from_slice(&requests[1].body)?;assert_eq!(resolution["status"],"resolved");assert_eq!(resolution["problem_id"],problem.to_string());

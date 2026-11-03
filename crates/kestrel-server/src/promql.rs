@@ -125,7 +125,7 @@ fn validate_complexity(query: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn label_ok(value: &str) -> bool {
+pub(crate) fn label_ok(value: &str) -> bool {
     !value.is_empty()
         && value
             .chars()

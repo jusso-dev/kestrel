@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 use minijinja::{context, Environment};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -189,16 +189,42 @@ pub fn sign_body(secret: &[u8], body: &[u8]) -> String {
 
 pub struct HttpNotifier {
     client: reqwest::Client,
+    egress: Option<Arc<kestrel_checks::EgressGuard>>,
+}
+
+fn http_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 impl HttpNotifier {
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
+            client: http_builder()
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            egress: None,
+        }
+    }
+
+    /// A notifier whose connections to tenant-supplied URLs pass `egress`.
+    pub fn guarded(egress: Arc<kestrel_checks::EgressGuard>) -> Self {
+        Self {
+            egress: Some(egress),
+            ..Self::new()
+        }
+    }
+
+    async fn client_for(&self, url: &str) -> Result<reqwest::Client, NotifyError> {
+        match &self.egress {
+            Some(egress) => egress
+                .apply(http_builder(), url)
+                .await
+                .map_err(NotifyError::new)?
+                .build()
+                .map_err(|err| NotifyError::new(err.to_string())),
+            None => Ok(self.client.clone()),
         }
     }
 }
@@ -222,22 +248,12 @@ impl Notifier for HttpNotifier {
             .unwrap_or("webhook");
         match kind {
             "slack" => {
-                post_json(
-                    &self.client,
-                    required(target, "webhook_url")?,
-                    &slack_body(msg),
-                    None,
-                )
-                .await
+                let url = required(target, "webhook_url")?;
+                post_json(&self.client_for(url).await?, url, &slack_body(msg), None).await
             }
             "teams" => {
-                post_json(
-                    &self.client,
-                    required(target, "webhook_url")?,
-                    &teams_body(msg),
-                    None,
-                )
-                .await
+                let url = required(target, "webhook_url")?;
+                post_json(&self.client_for(url).await?, url, &teams_body(msg), None).await
             }
             "pagerduty" => {
                 let url = target
@@ -245,7 +261,7 @@ impl Notifier for HttpNotifier {
                     .and_then(Value::as_str)
                     .unwrap_or("https://events.pagerduty.com/v2/enqueue");
                 post_json(
-                    &self.client,
+                    &self.client_for(url).await?,
                     url,
                     &pagerduty_body(msg, required(target, "routing_key")?),
                     None,
@@ -259,7 +275,8 @@ impl Notifier for HttpNotifier {
                     .map_err(|err| NotifyError::new(err.to_string()))?;
                 let signature = sign_body(secret.as_bytes(), &body);
                 let response = self
-                    .client
+                    .client_for(url)
+                    .await?
                     .post(url)
                     .header("content-type", "application/json")
                     .header("x-kestrel-signature", signature)
@@ -427,8 +444,18 @@ pub async fn send_smtp(msg: &Rendered, target: &Value) -> Result<(), NotifyError
 }
 
 /// Apply the server SMTP defaults while preserving per-media overrides.
+///
+/// Server credentials are only added when the media uses the server's own
+/// relay (host and port unchanged), so a tenant-chosen relay never receives them.
 pub fn with_smtp_defaults(mut target: Value, smtp: Option<&crate::config::SmtpConfig>) -> Value {
     if let (Some(object), Some(smtp)) = (target.as_object_mut(), smtp) {
+        let host_default = object.get("smtp_host").is_none_or(|host| {
+            host.as_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(&smtp.host))
+        });
+        let port_default = object
+            .get("smtp_port")
+            .is_none_or(|port| port.as_u64() == Some(u64::from(smtp.port)));
         for (key, value) in [
             ("smtp_host", json!(smtp.host)),
             ("smtp_port", json!(smtp.port)),
@@ -437,11 +464,13 @@ pub fn with_smtp_defaults(mut target: Value, smtp: Option<&crate::config::SmtpCo
         ] {
             object.entry(key).or_insert(value);
         }
-        if let Some(user) = &smtp.username {
-            object.entry("username").or_insert(json!(user));
-        }
-        if let Some(password) = &smtp.password {
-            object.entry("password").or_insert(json!(password));
+        if host_default && port_default {
+            if let Some(user) = &smtp.username {
+                object.entry("username").or_insert(json!(user));
+            }
+            if let Some(password) = &smtp.password {
+                object.entry("password").or_insert(json!(password));
+            }
         }
     }
     target
@@ -565,6 +594,38 @@ mod tests {
             &allocation
         )
         .is_err());
+    }
+
+    #[test]
+    fn notify_smtp_credentials_stay_with_the_server_relay() {
+        let smtp = crate::config::SmtpConfig {
+            host: "mail.internal".into(),
+            port: 587,
+            username: Some("kestrel".into()),
+            password: Some("server-secret".into()),
+            from: "kestrel@example.test".into(),
+            starttls: true,
+        };
+        let inherited = with_smtp_defaults(json!({"to":"ops@example.test"}), Some(&smtp));
+        assert_eq!(inherited["password"], "server-secret");
+        let same = with_smtp_defaults(
+            json!({"smtp_host":"MAIL.internal","smtp_port":587}),
+            Some(&smtp),
+        );
+        assert_eq!(same["username"], "kestrel");
+        for target in [
+            json!({"smtp_host":"attacker.example"}),
+            json!({"smtp_port":2525}),
+            json!({"smtp_host":"mail.internal","smtp_port":"587"}),
+        ] {
+            let merged = with_smtp_defaults(target, Some(&smtp));
+            assert!(merged.get("username").is_none() && merged.get("password").is_none());
+        }
+        let own = with_smtp_defaults(
+            json!({"smtp_host":"relay.example","username":"me","password":"mine"}),
+            Some(&smtp),
+        );
+        assert_eq!(own["password"], "mine");
     }
 
     #[test]

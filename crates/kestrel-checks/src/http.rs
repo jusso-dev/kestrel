@@ -145,6 +145,15 @@ pub async fn probe_tls_expiry(
 }
 
 pub async fn run_http_check(check: &HttpCheck, now_ms: i64) -> HttpOutcome {
+    run_http_check_guarded(check, now_ms, None).await
+}
+
+/// [`run_http_check`] with connections restricted by `egress` when present.
+pub async fn run_http_check_guarded(
+    check: &HttpCheck,
+    now_ms: i64,
+    egress: Option<&Arc<crate::EgressGuard>>,
+) -> HttpOutcome {
     let valid = reqwest::Url::parse(&check.url).is_ok_and(|url| {
         matches!(url.scheme(), "http" | "https")
             && url.username().is_empty()
@@ -173,12 +182,17 @@ pub async fn run_http_check(check: &HttpCheck, now_ms: i64) -> HttpOutcome {
             expiry.clone(),
         )))
         .with_no_client_auth();
-    let client = match reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .timeout(check.timeout.max(Duration::from_millis(1)))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(egress) = egress {
+        builder = match egress.apply(builder, &check.url).await {
+            Ok(builder) => builder,
+            Err(err) => return failed(check, now_ms, None, 0.0, &err),
+        };
+    }
+    let client = match builder.build() {
         Ok(client) => client,
         Err(err) => return failed(check, now_ms, None, 0.0, &err.to_string()),
     };

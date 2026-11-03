@@ -2,8 +2,11 @@
 //!
 //! Each key gets a fixed window that starts at its first failure. Once a key
 //! reaches its limit, sign-in for that key is refused with 429 until the window
-//! ends; refused attempts do not extend it. Keys are counted whether or not the account exists, so a refusal does
-//! not reveal which email addresses are registered.
+//! ends; refused attempts do not extend it. Keys are counted whether or not the
+//! account exists, so a refusal does not reveal which email addresses are
+//! registered. The account key includes the source address, so nobody can lock
+//! another user out from elsewhere; the source limit bounds guessing across
+//! accounts.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -70,14 +73,19 @@ impl<K: Eq + Hash + Clone> Counter<K> {
         if windows.len() >= MAX_TRACKED && !windows.contains_key(&key) {
             windows.retain(|_, entry| entry.started + window > now);
             if windows.len() >= MAX_TRACKED {
-                // Still full of live windows: drop the oldest so new keys are
-                // always counted rather than silently ignored.
-                if let Some(oldest) = windows
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.started)
-                    .map(|(key, _)| key.clone())
-                {
-                    windows.remove(&oldest);
+                // Still full of live windows: drop the oldest one that is not
+                // throttled, so flooding new keys cannot release a lockout.
+                // Only when every window is throttled does the oldest go.
+                let limit = self.limit;
+                let oldest = |throttled: bool| {
+                    windows
+                        .iter()
+                        .filter(|(_, entry)| throttled || entry.failures < limit)
+                        .min_by_key(|(_, entry)| entry.started)
+                        .map(|(key, _)| key.clone())
+                };
+                if let Some(key) = oldest(false).or_else(|| oldest(true)) {
+                    windows.remove(&key);
                 }
             }
         }
@@ -95,23 +103,31 @@ impl<K: Eq + Hash + Clone> Counter<K> {
     }
 }
 
-/// Failed sign-in counters keyed by account and by source address.
+/// Failed sign-in counters keyed by account and source, and by source alone.
 ///
 /// [`LoginGuard::begin`] counts an attempt as a failure before the password is
 /// checked, so parallel guesses cannot overrun the limit;
-/// [`LoginGuard::succeeded`] takes it back.
+/// [`LoginGuard::release`] takes it back.
 pub struct LoginGuard {
     window: Duration,
     accounts: Counter<String>,
     sources: Counter<IpAddr>,
+    /// Bounds concurrent Argon2 verifications on the blocking pool.
+    pub(crate) verify_permits: tokio::sync::Semaphore,
 }
+
+/// Argon2 verifications that may run at once.
+const VERIFY_PERMITS: usize = 4;
+/// Longest failure window. Also keeps `Instant + window` from overflowing.
+const MAX_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 
 impl LoginGuard {
     pub fn new(max_per_account: u32, max_per_source: u32, window: Duration) -> Self {
         Self {
-            window: window.max(Duration::from_secs(1)),
+            window: window.clamp(Duration::from_secs(1), MAX_WINDOW),
             accounts: Counter::new(max_per_account),
             sources: Counter::new(max_per_source),
+            verify_permits: tokio::sync::Semaphore::new(VERIFY_PERMITS),
         }
     }
 
@@ -121,10 +137,11 @@ impl LoginGuard {
         self.begin_at(account, source, Instant::now())
     }
 
-    /// Release only this successful attempt, retaining failures and other
-    /// in-flight attempts. Do not modify a newer window after a slow request.
-    pub fn succeeded(&self, account: &str, source: Option<IpAddr>, reservation: Reservation) {
-        if let Some(entry) = self.accounts.lock().get_mut(&account_key(account)) {
+    /// Take back one attempt that was not a wrong password: it succeeded, or
+    /// the server failed before it could judge it. Failures and other in-flight
+    /// attempts stay, and a newer window is never touched by a slow request.
+    pub fn release(&self, account: &str, source: Option<IpAddr>, reservation: Reservation) {
+        if let Some(entry) = self.accounts.lock().get_mut(&account_key(account, source)) {
             if entry.started <= reservation.0 {
                 entry.failures = entry.failures.saturating_sub(1);
             }
@@ -144,7 +161,7 @@ impl LoginGuard {
         source: Option<IpAddr>,
         now: Instant,
     ) -> Result<Reservation, Throttled> {
-        let account = account_key(account);
+        let account = account_key(account, source);
         let source = source.map(source_key);
         // Lock order is always accounts then sources.
         let mut accounts = self.accounts.lock();
@@ -176,8 +193,11 @@ impl Default for LoginGuard {
     }
 }
 
-fn account_key(email: &str) -> String {
-    email.trim().to_lowercase()
+fn account_key(email: &str, source: Option<IpAddr>) -> String {
+    let source = source
+        .map(|ip| source_key(ip).to_string())
+        .unwrap_or_default();
+    format!("{}|{source}", email.trim().to_lowercase())
 }
 
 /// IPv6 clients usually control a whole /64, so count the prefix.
@@ -255,6 +275,48 @@ mod tests {
     }
 
     #[test]
+    fn another_source_cannot_lock_an_account_out() {
+        let guard = LoginGuard::new(2, 100, WINDOW);
+        let now = Instant::now();
+        let attacker: IpAddr = "198.51.100.1".parse().unwrap();
+        let owner: IpAddr = "203.0.113.1".parse().unwrap();
+        guard
+            .begin_at("a@example.com", Some(attacker), now)
+            .unwrap();
+        guard
+            .begin_at("a@example.com", Some(attacker), now)
+            .unwrap();
+        assert!(guard
+            .begin_at("A@example.com", Some(attacker), now)
+            .is_err());
+        assert!(guard.begin_at("a@example.com", Some(owner), now).is_ok());
+    }
+
+    #[test]
+    fn flooding_new_keys_does_not_release_a_throttled_account() {
+        let guard = LoginGuard::new(2, u32::MAX, WINDOW);
+        let now = Instant::now();
+        guard.begin_at("victim@example.com", None, now).unwrap();
+        guard.begin_at("victim@example.com", None, now).unwrap();
+        let later = now + Duration::from_secs(1);
+        for n in 0..MAX_TRACKED + 10 {
+            guard
+                .begin_at(&format!("flood{n}@example.com"), None, later)
+                .unwrap();
+        }
+        assert!(guard.begin_at("victim@example.com", None, later).is_err());
+    }
+
+    #[test]
+    fn a_huge_window_is_clamped_instead_of_overflowing() {
+        let guard = LoginGuard::new(1, 100, Duration::MAX);
+        let now = Instant::now();
+        guard.begin_at("a@example.com", None, now).unwrap();
+        let refused = guard.begin_at("a@example.com", None, now).unwrap_err();
+        assert_eq!(refused.retry_after, MAX_WINDOW);
+    }
+
+    #[test]
     fn refused_attempts_do_not_extend_the_window() {
         let guard = LoginGuard::new(1, 100, WINDOW);
         let start = Instant::now();
@@ -274,7 +336,7 @@ mod tests {
         let now = Instant::now();
         guard.begin_at("one@example.com", Some(ip), now).unwrap();
         let reservation = guard.begin_at("two@example.com", Some(ip), now).unwrap();
-        guard.succeeded("two@example.com", Some(ip), reservation);
+        guard.release("two@example.com", Some(ip), reservation);
         guard.begin_at("three@example.com", Some(ip), now).unwrap();
         assert!(guard.begin_at("four@example.com", Some(ip), now).is_err());
         assert!(guard.begin_at("four@example.com", None, now).is_ok());
@@ -288,7 +350,7 @@ mod tests {
         for n in 0..10 {
             let account = format!("user{n}@example.com");
             let reservation = guard.begin_at(&account, Some(ip), now).unwrap();
-            guard.succeeded(&account, Some(ip), reservation);
+            guard.release(&account, Some(ip), reservation);
         }
     }
 
@@ -299,7 +361,7 @@ mod tests {
         guard.begin_at("a@example.com", None, now).unwrap();
         let success = guard.begin_at("a@example.com", None, now).unwrap();
         guard.begin_at("a@example.com", None, now).unwrap();
-        guard.succeeded("a@example.com", None, success);
+        guard.release("a@example.com", None, success);
         assert!(guard.begin_at("a@example.com", None, now).is_ok());
         assert!(guard.begin_at("a@example.com", None, now).is_err());
     }
@@ -313,7 +375,7 @@ mod tests {
         guard
             .begin_at("a@example.com", Some(ip), now + WINDOW)
             .unwrap();
-        guard.succeeded("a@example.com", Some(ip), old);
+        guard.release("a@example.com", Some(ip), old);
         assert!(guard
             .begin_at("a@example.com", Some(ip), now + WINDOW)
             .is_err());
