@@ -12,6 +12,7 @@ pub mod escalation;
 pub mod forward;
 mod http;
 pub mod ingest;
+pub mod login_guard;
 pub mod maintenance;
 pub mod notify;
 pub mod otlp;

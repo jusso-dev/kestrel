@@ -1,4 +1,4 @@
-# Copy into .github/workflows when release credentials have been configured.
+# Manual only. Signing steps fail fast until the release secrets are configured.
 # Every packaging failure is fatal; an artifact upload is not a release.
 name: release
 on:
@@ -12,8 +12,12 @@ jobs:
       matrix:
         target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
       - run: sudo apt-get update && sudo apt-get install -y minisign
       - run: cargo install cross --locked
       - name: Static agent under 15 MB
@@ -46,7 +50,7 @@ jobs:
             minisign -S -s "$signing_key" -m "$artifact" </dev/null
             minisign -V -p artifacts/minisign.pub -m "$artifact"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-${{ matrix.target }}
           path: artifacts/*
@@ -54,12 +58,16 @@ jobs:
   agent-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
       - run: cargo install cargo-wix --locked
       - run: cargo build --locked --release -p kestrel-agent
       - run: cargo wix -p kestrel-agent --no-build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-windows
           path: target/wix/*.msi
@@ -67,8 +75,12 @@ jobs:
   agent-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
       - run: cargo build --locked --release -p kestrel-agent
       - name: Sign agent
         env:
@@ -100,7 +112,7 @@ jobs:
           xcrun notarytool submit kestrel-agent.pkg --keychain-profile "$NOTARY_PROFILE" --wait
           xcrun stapler staple kestrel-agent.pkg
           xcrun stapler validate kestrel-agent.pkg
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-macos
           path: kestrel-agent.pkg
@@ -109,9 +121,13 @@ jobs:
     # Native packages require glibc >= 2.35; the container is the portable option.
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler ruby-dev rpm
@@ -130,8 +146,8 @@ jobs:
           docker --context default build -f Dockerfile.server -t kestrel-server:0.0.1 .
           docker --context default save kestrel-server:0.0.1 | gzip > artifacts/kestrel-server-image.tar.gz
           cd artifacts
-          sha256sum * > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+          sha256sum -- * > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: server
           path: artifacts/*

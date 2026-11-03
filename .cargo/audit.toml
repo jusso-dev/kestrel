@@ -1,0 +1,25 @@
+# cargo audit configuration. Every ignore needs a reason and a way out.
+# Unmaintained and unsound warnings are reported but do not fail the audit.
+
+[advisories]
+ignore = [
+    # rsa: Marvin timing side channel, no fixed release. rsa is never built:
+    # it reaches Cargo.lock only through sqlx-mysql, which sqlx names in weak
+    # `sqlx-mysql?/...` features (rust-lang/cargo#10801). `cargo tree -i rsa
+    # --target all -e all` prints nothing. Drop once sqlx or cargo stops
+    # locking unused optional dependencies.
+    "RUSTSEC-2023-0071",
+
+    # zip 2.x: extraction flaws in `ZipArchive::extract`/`ZipStreamReader::extract`
+    # (symlinks, SUID bits, permissions through symlinks, abort on large symlink).
+    # zip is only a build dependency of utoipa-swagger-ui 8, whose build script
+    # unpacks the Swagger UI archive bundled in utoipa-swagger-ui-vendored (pinned
+    # by checksum in Cargo.lock) with its own `enclosed_name` loop into OUT_DIR.
+    # No untrusted archive is read and zip is not in any binary. The fixed zip
+    # (>= 9) needs utoipa-swagger-ui 10, which needs axum 0.8 and utoipa 6.
+    # Drop with that upgrade.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+]

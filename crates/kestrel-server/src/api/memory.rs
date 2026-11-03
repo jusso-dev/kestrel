@@ -1,5 +1,9 @@
 //! In-memory API catalogue. Every read and write filters on `tenant_id`.
 
+use super::{
+    decide_login, tenant_choices, LoginAttempt, LoginCandidate, LoginDecision, LoginOutcome,
+    MAX_LOGIN_CANDIDATES,
+};
 use crate::authz::{group_visible, scope_for};
 use crate::passwords::{hash_password, random_token, token_hash, verify_password};
 use serde_json::{json, Value};
@@ -52,6 +56,7 @@ struct AuditRow {
     user_id: Uuid,
     action: String,
     target: String,
+    detail: Value,
 }
 
 struct Grant {
@@ -128,25 +133,95 @@ impl MemoryCatalog {
         self.lock().grants.push(Grant { user_id, tenant_id });
     }
 
-    pub fn login(&self, email: &str, password: &str) -> Result<String, Rejected> {
-        let mut inner = self.lock();
-        let found = inner
-            .users
-            .iter()
-            .find(|user| user.email == email)
-            .map(|user| (user.id, user.tenant_id, user.password_hash.clone()));
-        let Some((user_id, tenant_id, hash)) = found else {
-            let _ = verify_password(password, "");
-            return Err(Rejected);
+    pub(crate) fn login(&self, attempt: &LoginAttempt<'_>) -> LoginOutcome {
+        let (tenant, candidates) = {
+            let inner = self.lock();
+            let tenant = match attempt.tenant {
+                Some(wanted) => match inner
+                    .tenants
+                    .iter()
+                    .find(|tenant| tenant.name == wanted || tenant.id.to_string() == wanted)
+                {
+                    Some(tenant) => Some(tenant.id),
+                    None => {
+                        drop(inner);
+                        let _ = verify_password(attempt.password, "");
+                        return LoginOutcome::Refused;
+                    }
+                },
+                None => None,
+            };
+            let tenant_name = |id: Uuid| {
+                inner
+                    .tenants
+                    .iter()
+                    .find(|tenant| tenant.id == id)
+                    .map(|tenant| tenant.name.clone())
+                    .unwrap_or_default()
+            };
+            let mut candidates: Vec<LoginCandidate> = inner
+                .users
+                .iter()
+                .filter(|user| user.email == attempt.email)
+                .filter(|user| tenant.is_none_or(|id| user.tenant_id == id))
+                .map(|user| LoginCandidate {
+                    user_id: user.id,
+                    tenant_id: user.tenant_id,
+                    tenant_name: tenant_name(user.tenant_id),
+                    password_hash: user.password_hash.clone(),
+                })
+                .collect();
+            candidates.sort_by(|a, b| a.tenant_name.cmp(&b.tenant_name));
+            candidates.truncate(MAX_LOGIN_CANDIDATES);
+            (tenant, candidates)
         };
-        if !verify_password(password, &hash) {
-            return Err(Rejected);
-        }
-        let secret = random_token("sess_").map_err(|_| Rejected)?;
-        inner
-            .sessions
-            .insert(token_hash(&secret), SessionRow { user_id, tenant_id });
-        Ok(secret)
+        let detail = json!({ "email": attempt.email, "source": attempt.source });
+        let user = match decide_login(attempt.password, &candidates) {
+            LoginDecision::Accept(index) => &candidates[index],
+            LoginDecision::Choose(matched) => {
+                return LoginOutcome::ChooseTenant(tenant_choices(&candidates, &matched))
+            }
+            LoginDecision::Refuse => {
+                let mut inner = self.lock();
+                let targets: Vec<(Uuid, Uuid)> = match (candidates.is_empty(), tenant) {
+                    (false, _) => candidates
+                        .iter()
+                        .map(|candidate| (candidate.tenant_id, candidate.user_id))
+                        .collect(),
+                    (true, Some(tenant)) => vec![(tenant, Uuid::nil())],
+                    (true, None) => Vec::new(),
+                };
+                for (tenant_id, user_id) in targets {
+                    inner.audits.push(AuditRow {
+                        tenant_id,
+                        user_id,
+                        action: "session.login_failed".to_string(),
+                        target: attempt.email.to_string(),
+                        detail: detail.clone(),
+                    });
+                }
+                return LoginOutcome::Refused;
+            }
+        };
+        let Ok(secret) = random_token("sess_") else {
+            return LoginOutcome::Refused;
+        };
+        let mut inner = self.lock();
+        inner.sessions.insert(
+            token_hash(&secret),
+            SessionRow {
+                user_id: user.user_id,
+                tenant_id: user.tenant_id,
+            },
+        );
+        inner.audits.push(AuditRow {
+            tenant_id: user.tenant_id,
+            user_id: user.user_id,
+            action: "session.login".to_string(),
+            target: user.user_id.to_string(),
+            detail,
+        });
+        LoginOutcome::Session(secret)
     }
 
     pub fn logout(&self, secret: &str) {
@@ -426,6 +501,7 @@ impl MemoryCatalog {
                 json!({
                     "action": row.action,
                     "target": row.target,
+                    "detail": row.detail,
                     "user_id": row.user_id,
                     "tenant_id": row.tenant_id,
                 })
@@ -537,6 +613,7 @@ impl MemoryCatalog {
             user_id: principal.user_id,
             action: action.to_string(),
             target: target.to_string(),
+            detail: json!({}),
         });
     }
 

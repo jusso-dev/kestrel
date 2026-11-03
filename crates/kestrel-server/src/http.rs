@@ -148,6 +148,12 @@ pub async fn start_with(
     api_state.directory = Some(Arc::clone(&store));
     api_state.smtp = cfg.smtp.clone();
     api_state.otlp_drop = cfg.otlp_drop_attributes.clone();
+    api_state.trusted_proxies = Arc::from(cfg.trusted_proxies.clone());
+    api_state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+        cfg.login.max_failures_per_account,
+        cfg.login.max_failures_per_source,
+        std::time::Duration::from_secs(cfg.login.failure_window_secs),
+    ));
     api_state.quotas = Arc::clone(&quotas);
     api_state.db = db.clone();
     api_state.secrets = Some(Arc::new(crate::secrets::SecretBox::load_or_create(
@@ -229,7 +235,7 @@ async fn spawn_listener(
         let result = axum_server::bind(addr)
             .acceptor(acceptor)
             .handle(bound_handle)
-            .serve(app.into_make_service())
+            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await;
         if let Err(err) = result {
             tracing::error!(error = %err, "https listener ended");

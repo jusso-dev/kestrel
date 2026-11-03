@@ -1,5 +1,34 @@
 use super::*;
 
+async fn sign_in(
+    state: &ApiState,
+    email: &str,
+    password: &str,
+    tenant: Option<&str>,
+) -> LoginOutcome {
+    state
+        .pg_login(&LoginAttempt {
+            email,
+            password,
+            tenant,
+            source: Some("192.0.2.10".parse().unwrap()),
+        })
+        .await
+        .unwrap()
+}
+
+async fn session_for(
+    state: &ApiState,
+    email: &str,
+    password: &str,
+    tenant: Option<&str>,
+) -> String {
+    match sign_in(state, email, password, tenant).await {
+        LoginOutcome::Session(secret) => secret,
+        _ => panic!("sign-in refused"),
+    }
+}
+
 #[tokio::test]
 async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
     let Ok(url) = std::env::var("DATABASE_URL") else {
@@ -44,8 +73,11 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         Arc::new(crate::MemoryStore::new()),
     )
     .with_database(db.clone(), Arc::clone(&secrets));
-    assert!(state.pg_login(&email, "wrong-password").await.is_err());
-    let session = state.pg_login(&email, "password-test").await.unwrap();
+    assert!(matches!(
+        sign_in(&state, &email, "wrong-password", None).await,
+        LoginOutcome::Refused
+    ));
+    let session = session_for(&state, &email, "password-test", None).await;
     let authenticated = state
         .pg_principal(Some(&session), None)
         .await
@@ -308,4 +340,147 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
             >= 10
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn api_postgres_login_selects_a_tenant_and_audits_failures() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let email = format!("{}@example.test", Uuid::new_v4());
+    let mut tenants = Vec::new();
+    for password in ["first-password", "second-password"] {
+        let id = Uuid::new_v4();
+        let name = format!("login-test-{id}");
+        sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+            .bind(id)
+            .bind(&name)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let user = db
+            .insert_user(
+                &crate::db::TenantId(id),
+                crate::db::NewUser {
+                    email: email.clone(),
+                    password_hash: crate::passwords::hash_password(password).unwrap(),
+                    role: "viewer".into(),
+                    host_group_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        tenants.push((id, name, user.id));
+    }
+    let dir = std::env::temp_dir().join(format!("kestrel-api-pg-login-{}", tenants[0].0));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+
+    // Ambiguous without a tenant: a wrong password is a plain refusal, the
+    // right one lists only the tenant it matched and issues no session.
+    assert!(matches!(
+        sign_in(&state, &email, "wrong-password", None).await,
+        LoginOutcome::Refused
+    ));
+    let LoginOutcome::ChooseTenant(choices) =
+        sign_in(&state, &email, "second-password", None).await
+    else {
+        panic!("expected a tenant choice");
+    };
+    assert_eq!(
+        choices,
+        vec![json!({"id": tenants[1].0, "name": tenants[1].1})]
+    );
+
+    // Each tenant signs in by name or id with its own password only.
+    let first = session_for(&state, &email, "first-password", Some(&tenants[0].1)).await;
+    let principal = state
+        .pg_principal(Some(&first), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (principal.tenant_id, principal.user_id),
+        (tenants[0].0, tenants[0].2)
+    );
+    let second = session_for(
+        &state,
+        &email,
+        "second-password",
+        Some(&tenants[1].0.to_string()),
+    )
+    .await;
+    let principal = state
+        .pg_principal(Some(&second), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(principal.tenant_id, tenants[1].0);
+    assert!(matches!(
+        sign_in(&state, &email, "second-password", Some(&tenants[0].1)).await,
+        LoginOutcome::Refused
+    ));
+    assert!(matches!(
+        sign_in(&state, &email, "first-password", Some("no-such-tenant")).await,
+        LoginOutcome::Refused
+    ));
+    assert!(matches!(
+        sign_in(&state, "nobody@example.test", "x", Some(&tenants[0].1)).await,
+        LoginOutcome::Refused
+    ));
+
+    let failures: Vec<(Option<Uuid>, String, Value)> = sqlx::query_as(
+        "SELECT user_id,target,detail FROM audit_log WHERE tenant_id=$1 AND action='session.login_failed' ORDER BY created_at,id",
+    )
+    .bind(tenants[0].0)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    // The ambiguous wrong password, the wrong tenant's password and the
+    // unknown email under this tenant.
+    assert_eq!(failures.len(), 3, "{failures:?}");
+    assert_eq!(failures[0].0, Some(tenants[0].2));
+    assert_eq!(failures[0].1, email);
+    assert_eq!(failures[0].2["source"], json!("192.0.2.10"));
+    assert_eq!(failures[2].0, None);
+    assert_eq!(failures[2].1, "nobody@example.test");
+    for (_, _, detail) in &failures {
+        assert!(!detail.to_string().contains("password"));
+    }
+    let logins: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND action='session.login'",
+    )
+    .bind(tenants[0].0)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logins, 1);
+
+    // A single-tenant email is unchanged.
+    let solo_tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+        .bind(solo_tenant)
+        .bind(format!("login-test-{solo_tenant}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let solo = format!("{solo_tenant}@example.test");
+    db.insert_user(
+        &crate::db::TenantId(solo_tenant),
+        crate::db::NewUser {
+            email: solo.clone(),
+            password_hash: crate::passwords::hash_password("solo-password").unwrap(),
+            role: "viewer".into(),
+            host_group_id: None,
+        },
+    )
+    .await
+    .unwrap();
+    session_for(&state, &solo, "solo-password", None).await;
 }

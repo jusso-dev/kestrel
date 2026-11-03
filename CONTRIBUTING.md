@@ -6,11 +6,16 @@ Thanks for looking at Kestrel. Issues and pull requests are welcome on GitHub.
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo audit
 ```
 
-The UI lives in `web/`. Run `npm ci`, `npm run check`, `npm run build` and `npm test` there. Install Playwright's Chromium browser with `npx playwright install chromium` before the browser tests. `npm test` builds and serves the production bundle for its browser checks. `npm run build` writes `web/build`, which the server embeds. From the repository root, export the OpenAPI document with `cargo run -q -p kestrel-server --example openapi --no-default-features > crates/kestrel-server/openapi.json`, then run `npm run gen:api` in `web/` to refresh the generated TypeScript client types.
+The minimum supported Rust version is the workspace `rust-version` (1.89). Raise it, and the `msrv` job in `.github/workflows/ci.yml`, when a dependency needs a newer compiler. `cargo audit` ignores are listed with their reasons in `.cargo/audit.toml`.
+
+The UI lives in `web/`. Run `npm ci`, `npm audit --audit-level=high`, `npm run check`, `npm run build` and `npm test` there. Install Playwright's Chromium browser with `npx playwright install chromium` before the browser tests. `npm test` builds and serves the production bundle for its browser checks. `npm run build` writes `web/build`, which the server embeds. Commit `web/build` with any change to `web/`: CI rebuilds it and fails if the committed copy differs.
+
+CI (`.github/workflows/ci.yml`) runs these checks on Linux, macOS and Windows for every pull request and push to `main`, plus the PostgreSQL tests against a `postgres:16` service. `release.yml` only runs when started by hand. From the repository root, export the OpenAPI document with `cargo run -q -p kestrel-server --example openapi --no-default-features > crates/kestrel-server/openapi.json`, then run `npm run gen:api` in `web/` to refresh the generated TypeScript client types.
 
 ## Tests
 

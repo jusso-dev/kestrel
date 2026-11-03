@@ -62,6 +62,35 @@ test('login submits credentials, handles refusal, and navigates on success', asy
   await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
 });
 
+test('login asks for a tenant when the email is in several, and reports throttling', async ({ page }) => {
+  const bodies: any[] = [];
+  await page.route('**/api/v1/login', async (route) => {
+    const body = route.request().postDataJSON();
+    bodies.push(body);
+    if (bodies.length === 1) {
+      await route.fulfill({ status: 409, contentType: 'application/problem+json', json: { status: 409, detail: 'choose', tenants: [{ id: 't-1', name: 'Acme' }, { id: 't-2', name: 'Globex' }] } });
+    } else if (bodies.length === 2) {
+      await route.fulfill({ status: 429, contentType: 'application/problem+json', json: { status: 429 } });
+    } else {
+      await route.fulfill({ json: { email: body.email } });
+    }
+  });
+  await page.goto('/login');
+  await page.getByLabel('Email').fill('operator@example.com');
+  await page.getByLabel('Password').fill('test-password');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('alert')).toContainText('more than one tenant');
+  await page.getByLabel('Tenant').selectOption({ label: 'Globex' });
+  await page.getByLabel('Password').fill('test-password');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('alert')).toHaveText('Too many failed attempts. Try again later.');
+  await page.getByLabel('Password').fill('test-password');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: 'Overview' })).toBeVisible();
+  expect(bodies[0]).toEqual({ email: 'operator@example.com', password: 'test-password' });
+  expect(bodies[1]).toEqual({ email: 'operator@example.com', password: 'test-password', tenant: 't-2' });
+});
+
 test('SSE invalidates problems within two seconds and filters/acknowledges', async ({ page }) => {
   await page.addInitScript(() => {
     class FakeEvents extends EventTarget {

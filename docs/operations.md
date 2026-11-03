@@ -28,6 +28,28 @@ SIEM delivery is outbound only, to URLs an operator saved. Syslog uses TLS and R
 
 Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429.
 
+The same email address can have an account in more than one tenant. Sign-in then needs a tenant: `POST /api/v1/login` takes an optional `tenant` (name or id). Without one, a correct password returns 409 with the tenants it matched, and the UI asks the user to pick; a wrong password is a plain 401. An email in one tenant signs in as before.
+
+## Sign-in protection
+
+Failed sign-ins are counted per account (email, case-insensitive) and per source address (IPv4 address or IPv6 /64). An attempt counts before the password is checked and is taken back when it succeeds, so parallel guesses cannot overrun a limit and successful sign-ins from a shared NAT never lock it out. Once either limit is reached, sign-in for that key returns 429 with `Retry-After` until the window that began with its first failure ends. Unknown emails are counted the same way, so a 429 does not reveal whether an account exists. Counters are kept in memory per server process.
+
+```toml
+# Defaults.
+[login]
+max_failures_per_account = 10
+max_failures_per_source = 50
+failure_window_secs = 900
+```
+
+Behind a reverse proxy, list the proxy addresses so the client address is read from `X-Forwarded-For` (the right-most address that is not a trusted proxy). The header is ignored from any other peer.
+
+```toml
+trusted_proxies = ["10.0.0.5"]
+```
+
+Every refused password is audited as `session.login_failed` in the tenant of each account it was tried against, with the attempted email and source address and never the password. An attempt naming a tenant that has no such email is audited in that tenant. An unknown email with no tenant has no tenant to own the record and is only written to the server log. Successful sign-ins are audited as `session.login` with the source address. Both are forwarded to configured SIEM targets with `src_endpoint.ip`.
+
 ## Roles
 
 See [rbac.md](rbac.md).

@@ -1741,6 +1741,10 @@
                   "password": {
                     "format": "password",
                     "type": "string"
+                  },
+                  "tenant": {
+                    "description": "Tenant name or id. Required when the email exists in more than one tenant.",
+                    "type": "string"
                   }
                 },
                 "required": [

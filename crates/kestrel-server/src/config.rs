@@ -3,7 +3,7 @@
 use figment::providers::{Env, Format, Toml};
 use figment::Figment;
 use serde::Deserialize;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use url::Url;
 
@@ -93,6 +93,30 @@ pub struct ServerConfigFile {
     pub log_retention_days: u32,
     #[serde(default = "default_otlp_drop_attributes")]
     pub otlp_drop_attributes: Vec<String>,
+    /// Reverse proxies whose `X-Forwarded-For` header names the client.
+    #[serde(default)]
+    pub trusted_proxies: Vec<IpAddr>,
+    #[serde(default)]
+    pub login: LoginConfig,
+}
+
+/// Failed sign-in limits. A key over its limit gets 429 until the window ends.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct LoginConfig {
+    pub max_failures_per_account: u32,
+    pub max_failures_per_source: u32,
+    pub failure_window_secs: u64,
+}
+
+impl Default for LoginConfig {
+    fn default() -> Self {
+        Self {
+            max_failures_per_account: 10,
+            max_failures_per_source: 50,
+            failure_window_secs: 15 * 60,
+        }
+    }
 }
 
 fn default_log_retention_days() -> u32 {

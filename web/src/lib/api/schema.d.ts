@@ -1992,6 +1992,8 @@ export interface operations {
                     email: string;
                     /** Format: password */
                     password: string;
+                    /** @description Tenant name or id. Required when the email exists in more than one tenant. */
+                    tenant?: string;
                 };
             };
         };
