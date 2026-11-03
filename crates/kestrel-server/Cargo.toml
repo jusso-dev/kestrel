@@ -60,7 +60,7 @@ x509-parser = "0.16"
 webpki-roots = "1"
 
 [dev-dependencies]
-axum-test = "16"
+axum-test = "21"
 criterion = "0.5"
 figment = { version = "0.10", features = ["test"] }
 kestrel-agent = { path = "../kestrel-agent" }
