@@ -15,7 +15,7 @@ The minimum supported Rust version is the workspace `rust-version` (1.89). Raise
 
 The UI lives in `web/`. Run `npm ci`, `npm audit --audit-level=high`, `npm run check`, `npm run build` and `npm test` there. Install Playwright's Chromium browser with `npx playwright install chromium` before the browser tests. `npm test` builds and serves the production bundle for its browser checks. `npm run build` writes `web/build`, which the server embeds. Commit `web/build` with any change to `web/`: CI rebuilds it and fails if the committed copy differs.
 
-CI (`.github/workflows/ci.yml`) runs these checks on Linux, macOS and Windows for every pull request and push to `main`, plus the PostgreSQL tests against a `postgres:16` service. `release.yml` only runs when started by hand. From the repository root, export the OpenAPI document with `cargo run -q -p kestrel-server --example openapi --no-default-features > crates/kestrel-server/openapi.json`, then run `npm run gen:api` in `web/` to refresh the generated TypeScript client types.
+CI (`.github/workflows/ci.yml`) runs these checks on Linux, macOS and Windows for every pull request and push to `main`, plus the PostgreSQL, VictoriaMetrics and Mailpit integration tests against service containers. `packaging.yml` builds the static agents, installs and enrols them with `deploy/install.sh` on Ubuntu, Debian and RHEL, runs the MSI service on Windows and installs the macOS package. `release.yml` only runs when started by hand. From the repository root, export the OpenAPI document with `cargo run -q -p kestrel-server --example openapi --no-default-features > crates/kestrel-server/openapi.json`, then run `npm run gen:api` in `web/` to refresh the generated TypeScript client types.
 
 ## Tests
 

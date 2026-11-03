@@ -21,12 +21,12 @@ OTLP clients ----> /v1/metrics ----------------> +-----------------------------+
 - A `Scheduler` runs each collector at its interval on a tokio runtime.
 - Samples go into a `Buffer` (an append-only segment log on disk under the data dir, capped by size) and a `Shipper` drains it to the server. If the server is unreachable the buffer keeps filling and ships later in order.
 - Identity: on first start the agent creates a key pair and a CSR, and enrols with a one-time token. The server signs a client certificate. All later traffic uses that certificate.
-- Runs as an unprivileged `kestrel` user on Linux (with `CAP_DAC_READ_SEARCH` only if log tailing needs it), a virtual service account on Windows, and a launchd daemon user on macOS.
+- Runs as an unprivileged `kestrel` user on Linux (add it to the `adm` group, or grant `CAP_DAC_READ_SEARCH` in a unit drop-in, to tail root-owned logs), LocalSystem on Windows (installed by the MSI), and a launchd daemon user on macOS.
 
 ## Server
 
 - `axum` HTTP server with `rustls`. Ingest, API and UI on one port by default, ingest can be split onto its own port that requires client certificates.
-- Config and state in PostgreSQL through `sqlx` with compile-time checked queries and migrations in `crates/kestrel-server/migrations`.
+- Config and state in PostgreSQL through `sqlx` with bound runtime queries and migrations in `crates/kestrel-server/migrations`.
 - Metrics written to VictoriaMetrics with the Prometheus remote write protocol, read back with PromQL or MetricsQL over HTTP. A `MetricStore` trait keeps this swappable.
 - Rules engine: every trigger is an expression (PromQL subset) evaluated on a schedule. State machine per trigger and host: `Ok -> Pending -> Problem -> Resolved`, with `for` durations and hysteresis.
 - Notifier: a queue table in PostgreSQL (`notification_jobs`) drained by workers, so alerts survive restarts.

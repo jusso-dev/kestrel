@@ -398,7 +398,7 @@ mod tests {
         };
         let outcome = run_http_check(&check, 1_700_000_000_000).await;
         assert!(!outcome.up);
-        assert_eq!(outcome.status, Some(500));
+        assert_eq!(outcome.status, Some(500), "{}", outcome.detail);
         assert!(outcome
             .samples
             .iter()
@@ -484,6 +484,20 @@ mod tests {
                 };
                 let body = body.clone();
                 tokio::spawn(async move {
+                    // Consume the request before closing the socket. Closing
+                    // with unread bytes can reset the connection on macOS.
+                    use tokio::io::AsyncReadExt;
+                    let mut request = Vec::new();
+                    let mut chunk = [0; 1024];
+                    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                        if request.len() > 16 * 1024 {
+                            return;
+                        }
+                    }
                     if delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     }

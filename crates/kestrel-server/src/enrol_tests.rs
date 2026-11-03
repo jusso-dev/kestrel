@@ -265,3 +265,48 @@ async fn enrol_rejects_revoked_certificate() {
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn health_endpoints_and_per_source_login_limits_work_over_tls() {
+    let dir = scratch("health");
+    let mut cfg = server_config(&dir);
+    cfg.login.max_failures_per_account = 100;
+    cfg.login.max_failures_per_source = 2;
+    let server = tokio::time::timeout(Duration::from_secs(20), start(cfg))
+        .await
+        .expect("server start timed out")
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .add_root_certificate(
+            reqwest::Certificate::from_pem(&std::fs::read(dir.join("ca.crt")).unwrap()).unwrap(),
+        )
+        .use_rustls_tls()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    for (path, status) in [("healthz", "ok"), ("readyz", "ready")] {
+        let response = client
+            .get(format!("https://{}/{path}", server.addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["status"], status);
+    }
+    // The limit is keyed on the TLS peer address, so it only trips if the
+    // connection's address reaches the login handler.
+    let mut statuses = Vec::new();
+    for n in 0..3 {
+        let response = client
+            .post(format!("https://{}/api/v1/login", server.addr))
+            .json(&serde_json::json!({ "email": format!("guess{n}@example.com"), "password": "guess" }))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(response.status().as_u16());
+    }
+    assert_eq!(statuses, vec![401, 401, 429]);
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&dir);
+}

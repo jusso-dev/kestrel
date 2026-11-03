@@ -47,7 +47,7 @@ Set-Service kestrel-agent -StartupType Automatic
 Start-Service kestrel-agent
 ```
 
-The MSI creates a demand-start service so fresh installations do not launch before configuration exists. Configuration and data default to `C:\ProgramData\Kestrel`. Remove the temporary token file once enrolment succeeds. A token may remain in the protected configuration; the agent uses its saved certificate after enrolment.
+The MSI registers an automatic-start service but does not start it, so a fresh installation does not launch before configuration exists; start it once after `--configure` and it starts at every boot from then on. An unconfigured service exits at boot with an error. Configuration and data default to `C:\ProgramData\Kestrel`. Remove the temporary token file once enrolment succeeds. A token may remain in the protected configuration; the agent uses its saved certificate after enrolment.
 
 ## Config the server sends
 
@@ -75,3 +75,7 @@ Set `prometheus_listen = "127.0.0.1:9469"` to expose the latest samples at `/met
 - Linux: `deploy/systemd/kestrel-agent.service`
 - macOS: `deploy/launchd/au.jusso-dev.kestrel-agent.plist`
 - Windows: the MSI installs `--service`; the runtime responds to SCM stop and shutdown requests and flushes its buffer.
+
+On Unix, the agent handles SIGTERM and SIGINT by stopping collection and flushing its buffer.
+
+If the server cannot be reached when the agent first enrols, or returns a transient error after its certificate has expired, the agent logs the error and retries with backoff from 5 seconds up to 5 minutes. Rejected enrolment tokens, invalid local identity files and other permanent errors stop the agent. When renewal fails but the certificate is still valid, the agent continues using it and retries renewal later. An invalid server URL in the configuration still stops it.

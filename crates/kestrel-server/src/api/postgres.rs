@@ -880,6 +880,58 @@ impl ApiState {
         Ok(json!({"user_id":user,"tenant_id":target}))
     }
 
+    pub(super) async fn pg_grants(&self, principal: &Principal) -> Result<Value, ApiError> {
+        let db = self.db.as_ref().expect("PostgreSQL state");
+        let rows: Vec<Value> = sqlx::query_scalar(
+            "SELECT jsonb_build_object('tenant_id',t.id,'tenant',t.name,'user_id',u.id,'email',u.email,'role',g.role) \
+             FROM msp_grants g JOIN tenants t ON t.id=g.tenant_id JOIN users u ON u.id=g.user_id \
+             WHERE t.parent_id=$1 ORDER BY t.name,u.email",
+        )
+        .bind(principal.tenant_id)
+        .fetch_all(&db.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(json!({ "items": rows }))
+    }
+
+    /// Remove a grant into a direct child tenant and move any session that
+    /// switched into it back to the user's home tenant.
+    pub(super) async fn pg_revoke(
+        &self,
+        principal: &Principal,
+        user: Uuid,
+        target: Uuid,
+    ) -> Result<(), ApiError> {
+        let db = self.db.as_ref().expect("PostgreSQL state");
+        let mut tx = db.pool.begin().await.map_err(database_error)?;
+        let removed = sqlx::query(
+            "DELETE FROM msp_grants g USING tenants t WHERE g.tenant_id=t.id AND t.id=$1 AND t.parent_id=$2 AND g.user_id=$3",
+        )
+        .bind(target)
+        .bind(principal.tenant_id)
+        .bind(user)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_error)?;
+        if removed.rows_affected() == 0 {
+            return Err(fail(StatusCode::NOT_FOUND, "not found"));
+        }
+        sqlx::query("UPDATE sessions SET active_tenant_id=tenant_id WHERE user_id=$1 AND active_tenant_id=$2")
+            .bind(user)
+            .bind(target)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+        audit(
+            &mut tx,
+            principal,
+            "grant.delete",
+            &format!("{target}:{user}"),
+        )
+        .await?;
+        tx.commit().await.map_err(database_error)
+    }
+
     pub(super) async fn pg_link_template(
         &self,
         principal: &Principal,
@@ -1085,6 +1137,14 @@ impl ApiState {
             .execute(&mut *tx)
             .await
             .map_err(database_error)?;
+        if kind == "user" {
+            // Grants into other tenants have no foreign key to cascade from.
+            sqlx::query("DELETE FROM msp_grants WHERE user_id=$1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .map_err(database_error)?;
+        }
         audit(
             &mut tx,
             principal,

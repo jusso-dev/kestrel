@@ -510,6 +510,64 @@ impl MemoryCatalog {
         json!({ "items": items })
     }
 
+    /// Grants into the principal's direct child tenants.
+    pub fn grants(&self, principal: &Principal) -> Value {
+        let inner = self.lock();
+        let items: Vec<Value> = inner
+            .grants
+            .iter()
+            .filter_map(|grant| {
+                let tenant = inner.tenants.iter().find(|tenant| {
+                    tenant.id == grant.tenant_id && tenant.parent_id == Some(principal.tenant_id)
+                })?;
+                let email = inner
+                    .users
+                    .iter()
+                    .find(|user| user.id == grant.user_id)
+                    .map(|user| user.email.clone());
+                Some(json!({
+                    "tenant_id": tenant.id,
+                    "tenant": tenant.name,
+                    "user_id": grant.user_id,
+                    "email": email,
+                }))
+            })
+            .collect();
+        json!({ "items": items })
+    }
+
+    pub fn revoke_grant(&self, principal: &Principal, user_id: Uuid, tenant_id: Uuid) -> bool {
+        let mut inner = self.lock();
+        let child = inner
+            .tenants
+            .iter()
+            .any(|tenant| tenant.id == tenant_id && tenant.parent_id == Some(principal.tenant_id));
+        let before = inner.grants.len();
+        if child {
+            inner
+                .grants
+                .retain(|grant| !(grant.user_id == user_id && grant.tenant_id == tenant_id));
+        }
+        if inner.grants.len() == before {
+            return false;
+        }
+        let home = inner
+            .users
+            .iter()
+            .find(|user| user.id == user_id)
+            .map(|user| user.tenant_id);
+        if let Some(home) = home {
+            for session in inner.sessions.values_mut() {
+                if session.user_id == user_id && session.tenant_id == tenant_id {
+                    session.tenant_id = home;
+                }
+            }
+        }
+        drop(inner);
+        self.audit(principal, "grant.delete", &format!("{tenant_id}:{user_id}"));
+        true
+    }
+
     pub fn msp_overview(&self, principal: &Principal) -> Value {
         let inner = self.lock();
         let items: Vec<Value> = inner

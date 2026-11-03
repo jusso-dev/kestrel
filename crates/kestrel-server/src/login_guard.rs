@@ -20,6 +20,10 @@ pub struct Throttled {
     pub retry_after: Duration,
 }
 
+/// Identifies the window in which an attempt was counted.
+#[derive(Debug, Clone, Copy)]
+pub struct Reservation(Instant);
+
 #[derive(Debug, Clone, Copy)]
 struct Window {
     started: Instant,
@@ -113,18 +117,23 @@ impl LoginGuard {
 
     /// Refuse when the account or the source has used its failures, otherwise
     /// count this attempt against both.
-    pub fn begin(&self, account: &str, source: Option<IpAddr>) -> Result<(), Throttled> {
+    pub fn begin(&self, account: &str, source: Option<IpAddr>) -> Result<Reservation, Throttled> {
         self.begin_at(account, source, Instant::now())
     }
 
-    /// The password was right: clear the account and return the source's
-    /// attempt. The source keeps earlier failures so one valid account cannot
-    /// reset guessing against others.
-    pub fn succeeded(&self, account: &str, source: Option<IpAddr>) {
-        self.accounts.lock().remove(&account_key(account));
+    /// Release only this successful attempt, retaining failures and other
+    /// in-flight attempts. Do not modify a newer window after a slow request.
+    pub fn succeeded(&self, account: &str, source: Option<IpAddr>, reservation: Reservation) {
+        if let Some(entry) = self.accounts.lock().get_mut(&account_key(account)) {
+            if entry.started <= reservation.0 {
+                entry.failures = entry.failures.saturating_sub(1);
+            }
+        }
         if let Some(ip) = source {
             if let Some(entry) = self.sources.lock().get_mut(&source_key(ip)) {
-                entry.failures = entry.failures.saturating_sub(1);
+                if entry.started <= reservation.0 {
+                    entry.failures = entry.failures.saturating_sub(1);
+                }
             }
         }
     }
@@ -134,7 +143,7 @@ impl LoginGuard {
         account: &str,
         source: Option<IpAddr>,
         now: Instant,
-    ) -> Result<(), Throttled> {
+    ) -> Result<Reservation, Throttled> {
         let account = account_key(account);
         let source = source.map(source_key);
         // Lock order is always accounts then sources.
@@ -157,7 +166,7 @@ impl LoginGuard {
         if let Some(ip) = source {
             self.sources.add(&mut sources, ip, self.window, now);
         }
-        Ok(())
+        Ok(Reservation(now))
     }
 }
 
@@ -194,7 +203,11 @@ pub fn client_ip(
     trusted: &[IpAddr],
 ) -> Option<IpAddr> {
     let peer = peer?;
-    if !trusted.contains(&peer) {
+    let is_trusted = |address: IpAddr| {
+        let canonical = canonical_ip(address);
+        trusted.iter().any(|ip| canonical_ip(*ip) == canonical)
+    };
+    if !is_trusted(peer) {
         return Some(peer);
     }
     let Some(header) = forwarded_for else {
@@ -206,11 +219,18 @@ pub fn client_ip(
             break;
         };
         client = ip;
-        if !trusted.contains(&ip) {
+        if !is_trusted(ip) {
             break;
         }
     }
     Some(client)
+}
+
+fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
 }
 
 #[cfg(test)]
@@ -253,8 +273,8 @@ mod tests {
         let ip: IpAddr = "192.0.2.7".parse().unwrap();
         let now = Instant::now();
         guard.begin_at("one@example.com", Some(ip), now).unwrap();
-        guard.begin_at("two@example.com", Some(ip), now).unwrap();
-        guard.succeeded("two@example.com", Some(ip));
+        let reservation = guard.begin_at("two@example.com", Some(ip), now).unwrap();
+        guard.succeeded("two@example.com", Some(ip), reservation);
         guard.begin_at("three@example.com", Some(ip), now).unwrap();
         assert!(guard.begin_at("four@example.com", Some(ip), now).is_err());
         assert!(guard.begin_at("four@example.com", None, now).is_ok());
@@ -267,20 +287,36 @@ mod tests {
         let now = Instant::now();
         for n in 0..10 {
             let account = format!("user{n}@example.com");
-            guard.begin_at(&account, Some(ip), now).unwrap();
-            guard.succeeded(&account, Some(ip));
+            let reservation = guard.begin_at(&account, Some(ip), now).unwrap();
+            guard.succeeded(&account, Some(ip), reservation);
         }
     }
 
     #[test]
-    fn success_clears_the_account_counter() {
-        let guard = LoginGuard::new(2, 100, WINDOW);
+    fn success_releases_only_its_own_attempt() {
+        let guard = LoginGuard::new(3, 100, WINDOW);
         let now = Instant::now();
         guard.begin_at("a@example.com", None, now).unwrap();
-        guard.succeeded("a@example.com", None);
+        let success = guard.begin_at("a@example.com", None, now).unwrap();
         guard.begin_at("a@example.com", None, now).unwrap();
+        guard.succeeded("a@example.com", None, success);
         assert!(guard.begin_at("a@example.com", None, now).is_ok());
         assert!(guard.begin_at("a@example.com", None, now).is_err());
+    }
+
+    #[test]
+    fn late_success_does_not_release_a_new_window() {
+        let guard = LoginGuard::new(1, 1, WINDOW);
+        let now = Instant::now();
+        let ip = "192.0.2.9".parse().unwrap();
+        let old = guard.begin_at("a@example.com", Some(ip), now).unwrap();
+        guard
+            .begin_at("a@example.com", Some(ip), now + WINDOW)
+            .unwrap();
+        guard.succeeded("a@example.com", Some(ip), old);
+        assert!(guard
+            .begin_at("a@example.com", Some(ip), now + WINDOW)
+            .is_err());
     }
 
     #[test]
@@ -328,5 +364,17 @@ mod tests {
             Some(proxy)
         );
         assert_eq!(client_ip(None, Some("203.0.113.5"), &[proxy]), None);
+        assert_eq!(
+            client_ip(
+                Some("::ffff:10.0.0.1".parse().unwrap()),
+                Some("203.0.113.5"),
+                &[proxy],
+            ),
+            Some("203.0.113.5".parse().unwrap())
+        );
+        assert_eq!(
+            client_ip(Some(proxy), Some("203.0.113.5, ::ffff:10.0.0.1"), &[proxy],),
+            Some("203.0.113.5".parse().unwrap())
+        );
     }
 }

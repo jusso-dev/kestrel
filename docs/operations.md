@@ -26,7 +26,7 @@ SIEM delivery is outbound only, to URLs an operator saved. Syslog uses TLS and R
 
 ## Tenants
 
-Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429.
+Every tenant-owned query includes `tenant_id`. An MSP user sees another tenant only after an explicit grant. Ingest is limited per tenant; the limit responds with 429. An owner grants a user of their tenant a role in a direct child tenant with `POST /api/v1/msp/grants`, lists those grants with `GET /api/v1/msp/grants` and revokes one with `POST /api/v1/msp/grants/revoke` (`user_id`, `tenant_id`). Revoking moves any session that switched into the child back to the user's home tenant.
 
 The same email address can have an account in more than one tenant. Sign-in then needs a tenant: `POST /api/v1/login` takes an optional `tenant` (name or id). Without one, a correct password returns 409 with the tenants it matched, and the UI asks the user to pick; a wrong password is a plain 401. An email in one tenant signs in as before.
 
@@ -50,6 +50,14 @@ trusted_proxies = ["10.0.0.5"]
 
 Every refused password is audited as `session.login_failed` in the tenant of each account it was tried against, with the attempted email and source address and never the password. An attempt naming a tenant that has no such email is audited in that tenant. An unknown email with no tenant has no tenant to own the record and is only written to the server log. Successful sign-ins are audited as `session.login` with the source address. Both are forwarded to configured SIEM targets with `src_endpoint.ip`.
 
+## Users
+
+Deleting a user ends their sessions and API tokens and removes their MSP grants. Their audit entries stay, with the user link cleared. This needs PostgreSQL 15 or later.
+
+## Health
+
+`GET /healthz` answers 200 while the process serves requests. `GET /readyz` answers 200 when PostgreSQL responds within two seconds and 503 otherwise. Neither needs authentication or returns detail. The server stops on SIGTERM or Ctrl-C, finishes in-flight requests and drains queued metric writes before exiting.
+
 ## Roles
 
 See [rbac.md](rbac.md).
@@ -70,7 +78,7 @@ Do not start an older binary against a migrated database unless its release expl
 
 ## Packaging and verification
 
-The [release recipe](ci/release.yml) builds both Linux musl architectures, checks static linkage and the 15 MB agent limit, builds the Windows MSI, signs the macOS agent and installer, notarises and staples the package, and packages the server as deb, rpm and a distroless container. macOS signing requires a configured runner keychain with Developer ID Application and Installer identities plus a notarytool profile. Native server packages built on Ubuntu 22.04 require glibc 2.35 or later; use the container on older distributions. See [validation](VALIDATION.md) for checks actually executed; a recipe is not evidence that platform installation passed.
+The [release recipe](../.github/workflows/release.yml) builds both Linux musl architectures, checks static linkage and the 15 MB agent limit, builds the Windows MSI, signs the macOS agent and installer, notarises and staples the package, and packages the server as deb, rpm and a distroless container. macOS signing requires a configured runner keychain with Developer ID Application and Installer identities plus a notarytool profile. Native server packages built on Ubuntu 22.04 require glibc 2.35 or later; use the container on older distributions. See [validation](VALIDATION.md) for checks actually executed; a recipe is not evidence that platform installation passed.
 
 Linux releases require the GitHub Actions secret `RELEASE_MINISIGN_SECRET_KEY`, containing the complete dedicated, unencrypted minisign secret-key file. Prepare that key outside CI with `minisign -G -W`, store its contents directly through GitHub's secret settings, and keep the original protected; never commit it or put its contents in logs or command arguments. The signing step writes it to an owner-only temporary file outside the artifact directory, removes the environment variable before invoking minisign, and deletes the file when the step exits. Missing or invalid signing configuration fails the job.
 

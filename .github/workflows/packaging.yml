@@ -1,0 +1,267 @@
+name: packaging
+
+# Installs real packages on each platform. Needs no release credentials:
+# signing, notarisation and publishing are in release.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/**"
+      - "deploy/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/packaging.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  agent-linux:
+    name: static agent (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+      - run: cross build --locked --release --target "$TARGET" -p kestrel-agent
+        env:
+          TARGET: ${{ matrix.target }}
+      - name: Static, under 15 MB, and runs
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          binary="target/$TARGET/release/kestrel-agent"
+          file "$binary" | tee binary-type.txt
+          grep -Eq 'statically linked|static-pie linked' binary-type.txt
+          size=$(stat -c %s "$binary")
+          echo "size: $size bytes"
+          test "$size" -lt 15000000
+          case "$TARGET" in
+            aarch64-*)
+              sudo apt-get update && sudo apt-get install -y qemu-user-static
+              qemu-aarch64-static "$binary" --version ;;
+            *) "$binary" --version ;;
+          esac
+          mkdir artifact && cp "$binary" artifact/kestrel-agent
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-${{ matrix.target }}
+          path: artifact/kestrel-agent
+          if-no-files-found: error
+
+  install-linux:
+    name: install and enrol (${{ matrix.name }})
+    needs: agent-linux
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The runner itself, so the systemd unit really starts.
+          - name: ubuntu with systemd
+            image: ""
+          - name: debian 12
+            image: debian:12
+          - name: rhel ubi 9
+            image: registry.access.redhat.com/ubi9/ubi:latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agent-x86_64-unknown-linux-musl
+          path: dist
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release -p kestrel-server -p kestrel-cli
+      - name: Start the server and an HTTPS download host
+        run: |
+          work="$RUNNER_TEMP/kestrel"
+          mkdir -p "$work/dl"
+          echo "KESTREL_WORK=$work" >> "$GITHUB_ENV"
+          cat > "$work/server.toml" <<EOF
+          listen = "127.0.0.1:8443"
+          database_url = "postgres://postgres:postgres@127.0.0.1:5432/postgres"
+          victoria_url = "http://127.0.0.1:8428"
+          public_url = "https://127.0.0.1:8443"
+          data_dir = "$work/server"
+          [tls]
+          cert_path = "$work/server.crt"
+          key_path = "$work/server.key"
+          [ca]
+          cert_path = "$work/ca.crt"
+          key_path = "$work/ca.key"
+          EOF
+          target/release/kestrel-server --config "$work/server.toml" > "$work/server.log" 2>&1 &
+          for _ in $(seq 60); do
+            if [ -f "$work/ca.crt" ] && curl -fsS --cacert "$work/ca.crt" https://127.0.0.1:8443/readyz; then break; fi
+            sleep 1
+          done
+          curl -fsS --cacert "$work/ca.crt" https://127.0.0.1:8443/readyz
+          # A stand-in for the release host: install.sh only downloads over HTTPS.
+          cp dist/kestrel-agent deploy/install.sh "$work/dl/"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=127.0.0.1 \
+            -addext subjectAltName=IP:127.0.0.1 -keyout "$work/dl.key" -out "$work/dl.crt"
+          (cd "$work/dl" && openssl s_server -WWW -quiet -accept 9443 -cert "$work/dl.crt" -key "$work/dl.key" > "$work/dl.log" 2>&1 &)
+          for _ in $(seq 20); do curl -fsS --cacert "$work/dl.crt" -o /dev/null https://127.0.0.1:9443/install.sh && break; sleep 1; done
+          target/release/kestrel token create --ttl 1h --data-dir "$work/server" > "$work/token"
+          sha256sum dist/kestrel-agent | cut -d' ' -f1 > "$work/sha256"
+      - name: curl | sh on the runner, with systemd
+        if: matrix.image == ''
+        run: |
+          work="$KESTREL_WORK"
+          curl -fsSL --cacert "$work/dl.crt" https://127.0.0.1:9443/install.sh \
+            | sudo env CURL_CA_BUNDLE="$work/dl.crt" sh -s -- --token "$(cat "$work/token")" \
+                --server https://127.0.0.1:8443 --url https://127.0.0.1:9443/kestrel-agent \
+                --sha256 "$(cat "$work/sha256")" --ca-file "$work/ca.crt"
+          for _ in $(seq 60); do sudo test -f /var/lib/kestrel/agent.crt && break; sleep 1; done
+          sudo test -f /var/lib/kestrel/agent.crt
+          systemctl is-active kestrel-agent
+          test "$(stat -c '%U:%G %a' /etc/kestrel/agent.toml)" = "root:kestrel 640"
+          test "$(sudo stat -c '%U %a' /var/lib/kestrel/agent.key)" = "kestrel 600"
+          sudo systemctl stop kestrel-agent
+          test "$(systemctl show -p Result --value kestrel-agent)" = success
+      - name: curl | sh in ${{ matrix.name }}
+        if: matrix.image != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          work="$KESTREL_WORK"
+          docker run --rm --network host -v "$work:$work" -e work="$work" "$IMAGE" sh -euc '
+            if command -v apt-get >/dev/null; then
+              apt-get update -qq && apt-get install -y -qq curl ca-certificates passwd util-linux >/dev/null
+            else
+              dnf install -y -q shadow-utils util-linux >/dev/null
+            fi
+            curl -fsSL --cacert "$work/dl.crt" https://127.0.0.1:9443/install.sh \
+              | CURL_CA_BUNDLE="$work/dl.crt" sh -s -- --token "$(cat "$work/token")" \
+                  --server https://127.0.0.1:8443 --url https://127.0.0.1:9443/kestrel-agent \
+                  --sha256 "$(cat "$work/sha256")" --ca-file "$work/ca.crt" --no-start
+            test "$(stat -c "%U:%G %a" /etc/kestrel/agent.toml)" = "root:kestrel 640"
+            # No systemd in the container: run the installed unit command as its user.
+            su -s /bin/sh kestrel -c "/usr/local/bin/kestrel-agent --config /etc/kestrel/agent.toml" > /tmp/agent.log 2>&1 &
+            for _ in $(seq 60); do test -f /var/lib/kestrel/agent.crt && break; sleep 1; done
+            test -f /var/lib/kestrel/agent.crt || { cat /tmp/agent.log; exit 1; }
+            echo "enrolled as $(cat /var/lib/kestrel/agent_id)"
+          '
+      - name: The server saw the enrolment
+        if: always()
+        run: |
+          cat "$KESTREL_WORK/server.log"
+          grep -q "agent enrolled" "$KESTREL_WORK/server.log"
+
+  windows-msi:
+    name: MSI service
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Install WiX 3 and cargo-wix
+        shell: pwsh
+        run: |
+          if (-not (Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v3*\bin\candle.exe' -ErrorAction SilentlyContinue)) {
+            choco install wixtoolset --version 3.14.1 -y --no-progress
+          }
+          $bin = (Get-ChildItem 'C:\Program Files (x86)\WiX Toolset v3*\bin\candle.exe' | Select-Object -First 1).Directory
+          "WIX=$($bin.Parent.FullName)\" >> $env:GITHUB_ENV
+          cargo install cargo-wix --version 0.3.9 --locked
+      - run: cargo build --locked --release -p kestrel-agent
+      - run: cargo wix -p kestrel-agent --no-build --nocapture
+      - name: Install, configure, run and stop the service
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem target\wix\*.msi | Select-Object -First 1).FullName
+          $install = Start-Process msiexec -ArgumentList '/i', "`"$msi`"", '/qn', '/l*v', 'msi-install.log' -Wait -PassThru
+          if ($install.ExitCode -ne 0) { Get-Content msi-install.log -Tail 50; throw "msiexec exited $($install.ExitCode)" }
+          $service = Get-Service kestrel-agent
+          if ($service.StartType -ne 'Automatic') { throw "start type is $($service.StartType)" }
+          if ($service.Status -ne 'Stopped') { throw 'the MSI must not start an unconfigured agent' }
+          $agent = 'C:\Program Files\Kestrel\kestrel-agent.exe'
+          & $agent --version
+          # Nothing listens on port 9, so enrolment keeps retrying and the
+          # service has to stay up and still stop on request.
+          'ci-placeholder-token' | & $agent --configure --server https://127.0.0.1:9 --token-stdin
+          if ($LASTEXITCODE -ne 0) { throw 'configure failed' }
+          Start-Service kestrel-agent
+          Start-Sleep -Seconds 15
+          if ((Get-Service kestrel-agent).Status -ne 'Running') { throw 'service stopped while enrolment was retrying' }
+          Stop-Service kestrel-agent
+          (Get-Service kestrel-agent).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+          $exit = (Get-CimInstance Win32_Service -Filter "Name='kestrel-agent'").ExitCode
+          if ($exit -ne 0) { throw "service exit code $exit" }
+          $remove = Start-Process msiexec -ArgumentList '/x', "`"$msi`"", '/qn' -Wait -PassThru
+          if ($remove.ExitCode -ne 0) { throw "uninstall exited $($remove.ExitCode)" }
+          if (Get-Service kestrel-agent -ErrorAction SilentlyContinue) { throw 'service left behind after uninstall' }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: msi-logs
+          path: msi-install.log
+          if-no-files-found: ignore
+
+  macos-pkg:
+    name: macOS pkg (unsigned)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-16)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo build --locked --release -p kestrel-agent
+      - name: Build and install the launchd package
+        run: |
+          plutil -lint deploy/launchd/au.jusso-dev.kestrel-agent.plist
+          mkdir -p pkgroot/usr/local/bin pkgroot/Library/LaunchDaemons
+          cp target/release/kestrel-agent pkgroot/usr/local/bin/
+          cp deploy/launchd/au.jusso-dev.kestrel-agent.plist pkgroot/Library/LaunchDaemons/
+          pkgbuild --root pkgroot --identifier au.jusso-dev.kestrel-agent --version 0.0.1 kestrel-agent.pkg
+          sudo installer -pkg kestrel-agent.pkg -target /
+          /usr/local/bin/kestrel-agent --version
+          plutil -lint /Library/LaunchDaemons/au.jusso-dev.kestrel-agent.plist

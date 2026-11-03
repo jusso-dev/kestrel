@@ -67,7 +67,7 @@ jobs:
       - run: cargo test --workspace --locked
 
   postgres:
-    name: test with PostgreSQL 16
+    name: test with PostgreSQL, VictoriaMetrics and Mailpit
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -81,10 +81,21 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
+      victoriametrics:
+        image: victoriametrics/victoria-metrics:v1.111.0
+        ports:
+          - 8428:8428
+      mailpit:
+        image: axllent/mailpit:v1.33.0
+        ports:
+          - 1025:1025
+          - 8025:8025
     env:
-      # PostgreSQL tests skip without DATABASE_URL. Each test creates and drops
-      # its own database, so the role needs CREATEDB.
+      # These tests skip when their service variable is unset.
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      VICTORIA_URL: http://localhost:8428
+      KESTREL_TEST_SMTP: localhost:1025
+      KESTREL_TEST_MAILPIT: http://localhost:8025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,6 +105,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --workspace --locked
+      - name: Committed OpenAPI document is current
+        run: |
+          cargo run -q --locked -p kestrel-server --example openapi --no-default-features > openapi.fresh.json
+          diff -u crates/kestrel-server/openapi.json openapi.fresh.json || {
+            echo "::error::Regenerate crates/kestrel-server/openapi.json (see CONTRIBUTING.md)."
+            exit 1
+          }
 
   msrv:
     name: msrv (1.89)
@@ -155,6 +173,13 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - run: npm ci
+      - name: Generated API types match openapi.json
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/lib/api/schema.d.ts || {
+            echo "::error::Run 'npm run gen:api' in web/ and commit src/lib/api/schema.d.ts."
+            exit 1
+          }
       - run: npm run check
       - run: npm run build
       # The server embeds web/build, so the committed copy must be current.

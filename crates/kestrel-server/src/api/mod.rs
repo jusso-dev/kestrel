@@ -266,6 +266,20 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         location: Location::Api,
     },
     RouteSpec {
+        method: "GET",
+        path: "/healthz",
+        operation: "healthz",
+        auth: AuthKind::Public,
+        location: Location::Http,
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/readyz",
+        operation: "readyz",
+        auth: AuthKind::Public,
+        location: Location::Http,
+    },
+    RouteSpec {
         method: "POST",
         path: "/api/v1/enrol",
         operation: "enrol",
@@ -574,6 +588,20 @@ pub(crate) const ROUTES: &[RouteSpec] = &[
         location: Location::Api,
     },
     RouteSpec {
+        method: "GET",
+        path: "/api/v1/msp/grants",
+        operation: "msp_grants",
+        auth: AuthKind::User(Permission::TenantAdmin),
+        location: Location::Api,
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/api/v1/msp/grants/revoke",
+        operation: "revoke_grant",
+        auth: AuthKind::User(Permission::TenantAdmin),
+        location: Location::Api,
+    },
+    RouteSpec {
         method: "POST",
         path: "/v1/metrics",
         operation: "otlp_metrics",
@@ -742,6 +770,8 @@ fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
         "switch_tenant" => post(switch_tenant),
         "msp_overview" => get(msp_overview),
         "create_grant" => post(create_grant),
+        "msp_grants" => get(msp_grants),
+        "revoke_grant" => post(revoke_grant),
         "otlp_metrics" => post(otlp_metrics),
         other => panic!("route {other} has no handler"),
     }
@@ -932,6 +962,10 @@ struct MetricQuery {
     step: Option<u32>,
 }
 
+const MAX_LOGIN_EMAIL: usize = 320;
+const MAX_LOGIN_PASSWORD: usize = 1024;
+const MAX_LOGIN_TENANT: usize = 256;
+
 /// A user the sign-in could be for.
 pub(crate) struct LoginCandidate {
     pub user_id: Uuid,
@@ -992,6 +1026,16 @@ async fn login(
             "email and password are required",
         ));
     }
+    // Bound the Argon2 input and the throttle keys before doing any work.
+    if body.email.len() > MAX_LOGIN_EMAIL
+        || body.password.len() > MAX_LOGIN_PASSWORD
+        || body
+            .tenant
+            .as_ref()
+            .is_some_and(|tenant| tenant.len() > MAX_LOGIN_TENANT)
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "sign-in field too long"));
+    }
     let forwarded = headers
         .get_all("x-forwarded-for")
         .iter()
@@ -1003,19 +1047,22 @@ async fn login(
         Some(forwarded.as_str()).filter(|value| !value.is_empty()),
         &state.trusted_proxies,
     );
-    if let Err(throttled) = state.login_guard.begin(&body.email, source) {
-        tracing::warn!(source = ?source, "sign-in throttled after repeated failures");
-        let mut response = fail(
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many failed sign-in attempts; try again later",
-        )
-        .into_response();
-        let seconds = throttled.retry_after.as_secs().max(1).to_string();
-        if let Ok(value) = HeaderValue::from_str(&seconds) {
-            response.headers_mut().insert(header::RETRY_AFTER, value);
+    let reservation = match state.login_guard.begin(&body.email, source) {
+        Ok(reservation) => reservation,
+        Err(throttled) => {
+            tracing::warn!(source = ?source, "sign-in throttled after repeated failures");
+            let mut response = fail(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many failed sign-in attempts; try again later",
+            )
+            .into_response();
+            let seconds = throttled.retry_after.as_secs().max(1).to_string();
+            if let Ok(value) = HeaderValue::from_str(&seconds) {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+            return Ok(response);
         }
-        return Ok(response);
-    }
+    };
     let attempt = LoginAttempt {
         email: &body.email,
         password: &body.password,
@@ -1038,7 +1085,9 @@ async fn login(
             return Err(fail(StatusCode::UNAUTHORIZED, "invalid email or password"));
         }
         LoginOutcome::ChooseTenant(tenants) => {
-            state.login_guard.succeeded(&body.email, source);
+            state
+                .login_guard
+                .succeeded(&body.email, source, reservation);
             let body = json!({
                 "type": "about:blank",
                 "title": "Conflict",
@@ -1054,7 +1103,9 @@ async fn login(
                 .into_response());
         }
     };
-    state.login_guard.succeeded(&body.email, source);
+    state
+        .login_guard
+        .succeeded(&body.email, source, reservation);
     let cookie = session_cookie(&secret, state.secure_cookie);
     let mut response = Json(json!({ "email": body.email })).into_response();
     response.headers_mut().insert(
@@ -1983,22 +2034,49 @@ async fn msp_overview(
     Ok(Json(state.catalog.msp_overview(&principal)))
 }
 
+fn grant_ids(body: &Value) -> Result<(Uuid, Uuid), ApiError> {
+    let id = |field: &str| {
+        body.get(field)
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| fail(StatusCode::BAD_REQUEST, format!("{field} is required")))
+    };
+    Ok((id("user_id")?, id("tenant_id")?))
+}
+
+async fn msp_grants(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+) -> Result<Json<Value>, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    if state.db.is_some() {
+        return state.pg_grants(&principal).await.map(Json);
+    }
+    Ok(Json(state.catalog.grants(&principal)))
+}
+
+async fn revoke_grant(
+    State(state): State<ApiState>,
+    AuthUser(principal): AuthUser,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    ensure(&principal, Permission::TenantAdmin)?;
+    let (user_id, tenant_id) = grant_ids(&body)?;
+    if state.db.is_some() {
+        state.pg_revoke(&principal, user_id, tenant_id).await?;
+    } else if !state.catalog.revoke_grant(&principal, user_id, tenant_id) {
+        return Err(fail(StatusCode::NOT_FOUND, "not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn create_grant(
     State(state): State<ApiState>,
     AuthUser(principal): AuthUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     ensure(&principal, Permission::TenantAdmin)?;
-    let user_id = body
-        .get("user_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "user_id is required"))?;
-    let tenant_id = body
-        .get("tenant_id")
-        .and_then(Value::as_str)
-        .and_then(|value| Uuid::parse_str(value).ok())
-        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "tenant_id is required"))?;
+    let (user_id, tenant_id) = grant_ids(&body)?;
     if state.db.is_some() {
         return state
             .pg_grant(
@@ -2284,6 +2362,33 @@ mod tests {
             .await;
         assert_eq!(forged.status_code(), StatusCode::TOO_MANY_REQUESTS);
         login_server(state, "192.0.2.67")
+            .post("/api/v1/login")
+            .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
+            .await
+            .assert_status_ok();
+    }
+
+    #[tokio::test]
+    async fn login_rejects_oversized_fields_without_counting_them() {
+        let (mut state, _) = state_with("owner");
+        state.login_guard = Arc::new(crate::login_guard::LoginGuard::new(
+            1,
+            100,
+            std::time::Duration::from_secs(600),
+        ));
+        let server = login_server(state, "192.0.2.4");
+        for body in [
+            json!({ "email": "owner@example.com", "password": "x".repeat(1025) }),
+            json!({ "email": format!("{}@example.com", "a".repeat(320)), "password": "x" }),
+            json!({ "email": "owner@example.com", "password": "x", "tenant": "t".repeat(257) }),
+        ] {
+            server
+                .post("/api/v1/login")
+                .json(&body)
+                .await
+                .assert_status(StatusCode::BAD_REQUEST);
+        }
+        server
             .post("/api/v1/login")
             .json(&json!({ "email": "owner@example.com", "password": "correct-horse" }))
             .await

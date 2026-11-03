@@ -1,5 +1,9 @@
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("kestrel-agent {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if args.iter().any(|arg| arg == "--configure") {
         match kestrel_agent::bootstrap::from_stdin(&args) {
             Ok(path) => println!("Agent configured at {}", path.display()),

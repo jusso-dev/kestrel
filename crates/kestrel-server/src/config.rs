@@ -155,6 +155,13 @@ pub fn config_path_from_args(args: impl IntoIterator<Item = impl AsRef<str>>) ->
     default_config_path(Platform::current())
 }
 
+/// True when `--config` was passed. A named file that is missing is an error;
+/// only the platform default may be absent.
+pub fn config_flag_given(args: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    args.into_iter()
+        .any(|arg| arg.as_ref() == "--config" || arg.as_ref().starts_with("--config="))
+}
+
 /// Load `path` (when it exists) and apply `KESTREL_` environment overrides.
 ///
 /// Nested keys use `__`, so `KESTREL_TLS__CERT_PATH` sets `tls.cert_path`.

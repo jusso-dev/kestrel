@@ -484,3 +484,133 @@ async fn api_postgres_login_selects_a_tenant_and_audits_failures() {
     .unwrap();
     session_for(&state, &solo, "solo-password", None).await;
 }
+
+#[tokio::test]
+async fn api_postgres_revokes_grants_and_deletes_users_with_history() {
+    let Ok(url) = std::env::var("DATABASE_URL") else {
+        return;
+    };
+    let db = crate::db::Db::connect(&url).await.unwrap();
+    let tenant = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id,name) VALUES ($1,$2)")
+        .bind(tenant)
+        .bind(format!("offboard-{tenant}"))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let mut users = Vec::new();
+    for (name, role) in [("owner", "owner"), ("leaver", "operator")] {
+        let email = format!("{name}-{tenant}@example.test");
+        let user = db
+            .insert_user(
+                &crate::db::TenantId(tenant),
+                crate::db::NewUser {
+                    email: email.clone(),
+                    password_hash: crate::passwords::hash_password("password-test").unwrap(),
+                    role: role.into(),
+                    host_group_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        users.push((user.id, email, role));
+    }
+    let owner = Principal {
+        user_id: users[0].0,
+        tenant_id: tenant,
+        email: users[0].1.clone(),
+        role: "owner".into(),
+        host_group_id: None,
+    };
+    let leaver = users[1].0;
+    let dir = std::env::temp_dir().join(format!("kestrel-api-pg-offboard-{tenant}"));
+    let secrets =
+        Arc::new(crate::secrets::SecretBox::load_or_create(&dir.join("secret.key")).unwrap());
+    let state = ApiState::new(
+        Arc::new(MemoryCatalog::new()),
+        Arc::new(crate::MemoryStore::new()),
+    )
+    .with_database(db.clone(), secrets);
+    let session = session_for(&state, &users[1].1, "password-test", None).await;
+    let child = state
+        .pg_create_tenant(&owner, json!({"name":format!("offboard-child-{tenant}")}))
+        .await
+        .unwrap();
+    let child = Uuid::parse_str(child["id"].as_str().unwrap()).unwrap();
+    state
+        .pg_grant(&owner, leaver, child, "viewer")
+        .await
+        .unwrap();
+    let leaver_principal = state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .unwrap();
+    state
+        .pg_switch(&leaver_principal, &session, child)
+        .await
+        .unwrap();
+    let switched = state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(switched.tenant_id, child);
+
+    let listed = state.pg_grants(&owner).await.unwrap();
+    assert_eq!(listed["items"][0]["user_id"], json!(leaver));
+    assert_eq!(listed["items"][0]["role"], "viewer");
+    // Another tenant's owner cannot revoke it.
+    let stranger = Principal {
+        tenant_id: Uuid::new_v4(),
+        ..owner.clone()
+    };
+    assert!(state.pg_revoke(&stranger, leaver, child).await.is_err());
+    state.pg_revoke(&owner, leaver, child).await.unwrap();
+    assert!(state.pg_revoke(&owner, leaver, child).await.is_err());
+    let back_home = state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(back_home.tenant_id, tenant);
+    assert!(state.pg_switch(&back_home, &session, child).await.is_err());
+
+    // Delete a user who has signed in, holds a token, a grant and audit rows.
+    state
+        .pg_grant(&owner, leaver, child, "viewer")
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO api_tokens (tenant_id,user_id,name,token_hash) VALUES ($1,$2,'ci',$3)",
+    )
+    .bind(tenant)
+    .bind(leaver)
+    .bind(format!("hash-{leaver}"))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    state.pg_delete(&owner, "user", leaver).await.unwrap();
+    assert!(state
+        .pg_principal(Some(&session), None)
+        .await
+        .unwrap()
+        .is_none());
+    let left: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM sessions WHERE user_id=$1),(SELECT count(*) FROM api_tokens WHERE user_id=$1),(SELECT count(*) FROM msp_grants WHERE user_id=$1)",
+    )
+    .bind(leaver)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, (0, 0, 0));
+    let history: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_log WHERE tenant_id=$1 AND action='session.login' AND user_id IS NULL AND target=$2",
+    )
+    .bind(tenant)
+    .bind(leaver.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(history, 1, "the sign-in stays in the audit log");
+}

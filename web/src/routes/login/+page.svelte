@@ -14,7 +14,8 @@
     pending = true;
     message = '';
     try {
-      const body = tenant ? { email, password, tenant } : { email, password };
+      const chosen = tenant.trim();
+      const body = chosen ? { email, password, tenant: chosen } : { email, password };
       const { response, error } = await api.POST('/api/v1/login', { body });
       if (response.ok) {
         await goto('/');
@@ -35,6 +36,7 @@
   }
 
   function emailChanged() {
+    if (!tenants.length) return;
     tenants = [];
     tenant = '';
   }
@@ -49,6 +51,8 @@
         {#each tenants as choice (choice.id)}<option value={choice.id}>{choice.name}</option>{/each}
       </select>
     </label>
+  {:else}
+    <label>Tenant (optional) <input class="mt-1 block w-full border border-[var(--line)] bg-transparent px-2 py-1" type="text" bind:value={tenant} autocomplete="organization" /></label>
   {/if}
   <label>Password <input class="mt-1 block w-full border border-[var(--line)] bg-transparent px-2 py-1" type="password" required bind:value={password} autocomplete="current-password" /></label>
   <button type="submit" disabled={pending} class="border border-[var(--line)] px-3 py-1 text-left">{pending ? 'Signing in…' : 'Continue'}</button>
