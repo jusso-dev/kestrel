@@ -12,7 +12,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1",
-    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/adapter-static": "^4.0.1",
     "@sveltejs/kit": "^2.8.1",
     "@sveltejs/vite-plugin-svelte": "^5.1.1",
     "@types/node": "^26.6.5",
