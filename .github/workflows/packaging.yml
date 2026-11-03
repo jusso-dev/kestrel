@@ -61,8 +61,11 @@ jobs:
           test "$size" -lt 15000000
           case "$TARGET" in
             aarch64-*)
-              sudo apt-get update && sudo apt-get install -y qemu-user-static
-              qemu-aarch64-static "$binary" --version ;;
+              # Newer Ubuntu ships qemu-user statically linked; older images
+              # name the binary qemu-aarch64-static.
+              sudo apt-get update && sudo apt-get install -y qemu-user
+              qemu=$(command -v qemu-aarch64-static || command -v qemu-aarch64)
+              "$qemu" "$binary" --version ;;
             *) "$binary" --version ;;
           esac
           mkdir artifact && cp "$binary" artifact/kestrel-agent
