@@ -683,11 +683,7 @@ pub fn router(state: ApiState) -> Router {
     for (path, methods) in groups {
         router = router.route(&axum_path(path), methods);
     }
-    let doc = serde_json::from_value(openapi_value()).expect("valid generated OpenAPI");
     router
-        .merge(
-            utoipa_swagger_ui::SwaggerUi::new("/api/v1/docs").url("/api/v1/docs/openapi.json", doc),
-        )
         .layer(tower_http::compression::CompressionLayer::new())
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .layer(tower_http::limit::RequestBodyLimitLayer::new(

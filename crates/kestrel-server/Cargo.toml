@@ -55,8 +55,6 @@ tower-service = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
-utoipa = { version = "5", features = ["chrono", "uuid"] }
-utoipa-swagger-ui = { version = "8", features = ["axum", "vendored"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 x509-parser = "0.16"
 webpki-roots = "1"
