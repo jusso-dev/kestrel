@@ -138,7 +138,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config protobuf-compiler ruby-dev rpm
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config protobuf-compiler ruby-dev rpm
       - run: npm ci && npm run build
         working-directory: web
       - run: cargo build --locked --release -p kestrel-server -p kestrel-cli
@@ -149,7 +149,7 @@ jobs:
           mkdir -p pkgroot/usr/bin artifacts
           cp target/release/kestrel-server target/release/kestrel pkgroot/usr/bin/
           for format in deb rpm; do
-            fpm -s dir -t "$format" -n kestrel-server -v 0.0.1 --license MIT --depends openssl -C pkgroot -p artifacts/ .
+            fpm -s dir -t "$format" -n kestrel-server -v 0.0.1 --license MIT -C pkgroot -p artifacts/ .
           done
           docker --context default build -f Dockerfile.server -t kestrel-server:0.0.1 .
           docker --context default save kestrel-server:0.0.1 | gzip > artifacts/kestrel-server-image.tar.gz

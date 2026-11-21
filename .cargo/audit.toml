@@ -9,4 +9,10 @@ ignore = [
     # --target all -e all` prints nothing. Drop once sqlx or cargo stops
     # locking unused optional dependencies.
     "RUSTSEC-2023-0071",
+    # libsqlite3-sys: C SQLite CVE-2026-119375. libsqlite3-sys is never built:
+    # it reaches Cargo.lock only through sqlx-sqlite, which sqlx names in weak
+    # `sqlx-sqlite?/...` features (rust-lang/cargo#10801). `cargo tree -i
+    # libsqlite3-sys --target all -e all` prints nothing. Drop once sqlx or
+    # cargo stops locking unused optional dependencies.
+    "RUSTSEC-2026-0459",
 ]

@@ -4,6 +4,8 @@ description = "Kestrel monitoring server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
 
 [features]
 default = ["embed-ui"]
@@ -13,7 +15,7 @@ embed-ui = ["dep:rust-embed"]
 age = "0.11"
 argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
-axum = "0.7"
+axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 chrono-tz = "0.10"
@@ -34,7 +36,7 @@ prost = "0.13"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rrule = "0.13"
+rrule = "0.14"
 rust-embed = { version = "8", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -43,7 +45,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 snap = "1"
-snmp2 = { version = "0.4", features = ["v3"] }
+snmp2 = { version = "0.5", features = ["v3"] }
 sqlx = { version = "0.8", default-features = false, features = ["chrono", "json", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 time = { version = "0.3", features = ["formatting", "parsing", "std"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -56,11 +58,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-x509-parser = "0.16"
+x509-parser = "0.18"
 webpki-roots = "1"
 
 [dev-dependencies]
-axum-test = "16"
+axum-test = "21"
 criterion = "0.5"
 figment = { version = "0.10", features = ["test"] }
 kestrel-agent = { path = "../kestrel-agent" }

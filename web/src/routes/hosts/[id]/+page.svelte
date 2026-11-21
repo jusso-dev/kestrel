@@ -1,13 +1,14 @@
 <script lang="ts">
-  import { page } from '$app/stores';
-  import TimeSeries from '$lib/TimeSeries.svelte';
-  import TimeRange from '$lib/TimeRange.svelte';
-  import { request, type Resource } from '$lib/api/client';
-  let range = '1h';
-  let customStart = '';
-  let customEnd = '';
-  let host: Resource | undefined;
-  let error = '';
+  import { untrack } from 'svelte';
+  import { page } from '$app/state';
+  import TimeSeries from '#lib/TimeSeries.svelte';
+  import TimeRange from '#lib/TimeRange.svelte';
+  import { request, type Resource } from '#lib/api/client.ts';
+  let range = $state('1h');
+  let customStart = $state('');
+  let customEnd = $state('');
+  let host = $state<Resource | undefined>(undefined);
+  let error = $state('');
   let generation = 0;
   async function load(id: string) {
     const current = ++generation;
@@ -16,7 +17,10 @@
     try { const next = await request<Resource>('/hosts/' + encodeURIComponent(id)); if (current === generation) host = next; }
     catch (cause) { if (current === generation) error = cause instanceof Error ? cause.message : 'Unable to load host.'; }
   }
-  $: if ($page.params.id) void load($page.params.id);
+  $effect(() => {
+    const id = page.params.id;
+    if (id) untrack(() => { void load(id); });
+  });
   const metrics: [string, string, boolean][] = [
     ['CPU', 'kestrel_cpu_usage_ratio', false], ['Memory', 'kestrel_memory_used_bytes', false],
     ['Disk', 'kestrel_filesystem_free_bytes', false],
@@ -30,7 +34,7 @@
     return rate ? 'rate(' + selector + '[5m])' : selector;
   }
 </script>
-<h1 class="text-2xl">Host {host?.name ?? $page.params.id}</h1>
+<h1 class="text-2xl">Host {host?.name ?? page.params.id}</h1>
 {#if error}<p role="alert">{error}</p>{/if}
 <TimeRange bind:range bind:customStart bind:customEnd />
 {#if host}

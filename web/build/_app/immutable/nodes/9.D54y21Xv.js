@@ -1,0 +1,1 @@
+import{A as e,M as t,S as n,w as r}from"../chunks/Cb91tRG4.js";import"../chunks/0XNIC6so.js";import{t as i}from"../chunks/8P-UOuWb.js";var a=r(`<h1 class="text-2xl">Problems</h1> <p class="mt-2 text-[var(--muted)]">Live problems for this tenant.</p> <!>`,1);function o(r){var o=a(),s=t(e(o),4);i(s,{}),n(r,o)}export{o as component};

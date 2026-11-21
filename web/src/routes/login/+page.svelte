@@ -1,6 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
-  import { api } from '$lib/api/client';
+  import { api } from '#lib/api/client.ts';
   type Tenant = { id: string; name: string };
   let email = '';
   let password = '';

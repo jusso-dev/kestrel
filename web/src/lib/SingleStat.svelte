@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { request } from '$lib/api/client';
+  import { request } from '#lib/api/client.ts';
   export let query: string;
   let value = 'Loading…';
   onMount(() => {

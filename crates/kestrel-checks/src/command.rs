@@ -129,14 +129,28 @@ pub async fn run_command(
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return Ok(unknown(
-                check,
-                &format!("could not start command: {err}"),
-                now_ms,
-            ))
+    let mut child = {
+        // On Linux a recently written executable can briefly fail with ETXTBSY
+        // if another thread forks while the writer's fd is still open. Retry
+        // transiently before reporting a start failure.
+        let mut attempts = 0u8;
+        loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 5 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(err) => {
+                    return Ok(unknown(
+                        check,
+                        &format!("could not start command: {err}"),
+                        now_ms,
+                    ))
+                }
+            }
         }
     };
     // Declared after `child` so it drops first, while the leader is unreaped

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { list, request } from '$lib/api/client';
+  import { list, request } from '#lib/api/client.ts';
 
   type Tenant = { id: string; name?: string; active?: boolean };
   let tenants: Tenant[] = [];

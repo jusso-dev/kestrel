@@ -133,7 +133,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn spa_bootstrap_has_exact_csp_hash_and_safe_caching() {
-        let server = axum_test::TestServer::new(router()).unwrap();
+        let server = axum_test::TestServer::new(router());
         let response = server.get("/hosts/example").await;
         response.assert_status_ok();
         response.assert_header(header::X_FRAME_OPTIONS, "DENY");
