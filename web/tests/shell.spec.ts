@@ -196,6 +196,45 @@ test('dashboard widgets persist as JSON and reload', async ({ page }) => {
   await expect.poll(() => saved.layout.length).toBe(0);
 });
 
+test('switching dashboards and hosts reloads data for the new route id', async ({ page }) => {
+  const dashboards: Record<string, any> = {
+    'dash-a': { id: 'dash-a', name: 'Alpha', layout: [{ type: 'stat', title: 'Alpha stat', query: 'up' }] },
+    'dash-b': { id: 'dash-b', name: 'Beta', layout: [{ type: 'stat', title: 'Beta stat', query: 'up' }] }
+  };
+  await page.route('**/api/v1/dashboards?*', (route) => route.fulfill({ json: { items: Object.values(dashboards), next: null } }));
+  await page.route('**/api/v1/dashboards/*', (route) => {
+    const id = route.request().url().split('/').pop()!;
+    return route.fulfill({ json: dashboards[id] });
+  });
+  await page.route('**/api/v1/metrics/query?*', (route) => route.fulfill({ json: { series: [{ points: [[1700000000, 1]] }] } }));
+  await page.goto('/dashboards/dash-a');
+  await expect(page.getByLabel('Name', { exact: true })).toHaveValue('Alpha');
+  await expect(page.getByRole('heading', { name: 'Alpha stat' })).toBeVisible();
+  await page.getByRole('link', { name: 'Beta', exact: true }).click();
+  await expect(page).toHaveURL(/\/dashboards\/dash-b$/);
+  await expect(page.getByLabel('Name', { exact: true })).toHaveValue('Beta');
+  await expect(page.getByRole('heading', { name: 'Beta stat' })).toBeVisible();
+
+  await page.route('**/api/v1/hosts?*', (route) => route.fulfill({ json: { items: [
+    { id: 'host-1', name: 'web-1', status: 'up' },
+    { id: 'host-2', name: 'db-2', status: 'up' }
+  ], next: null } }));
+  await page.route('**/api/v1/hosts/host-1', (route) => route.fulfill({ json: { id: 'host-1', name: 'web-1' } }));
+  await page.route('**/api/v1/hosts/host-2', (route) => route.fulfill({ json: { id: 'host-2', name: 'db-2' } }));
+  await page.route('**/api/v1/metrics/query_range?*', (route) => route.fulfill({ json: { series: [] } }));
+  await page.goto('/hosts/host-1');
+  await expect(page.getByRole('heading', { name: 'Host web-1' })).toBeVisible();
+  await page.evaluate(() => {
+    const link = document.createElement('a');
+    link.href = '/hosts/host-2';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  });
+  await expect(page).toHaveURL(/\/hosts\/host-2$/);
+  await expect(page.getByRole('heading', { name: 'Host db-2' })).toBeVisible();
+});
+
 test('tenant switching refreshes the administration overview', async ({ page }) => {
   let tenant = 'Home';
   await page.route('**/api/v1/tenants?*', (route) => route.fulfill({ json: { items: [
