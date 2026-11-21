@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { list, type Resource } from '$lib/api/client';
+  import { list, type Resource } from '#lib/api/client.ts';
   let items: Resource[] = [];
   let error = '';
   onMount(() => {

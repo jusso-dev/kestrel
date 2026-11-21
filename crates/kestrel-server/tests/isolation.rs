@@ -23,8 +23,7 @@ async fn isolation_lists_gets_and_metrics_stay_inside_the_tenant() {
     let state = ApiState::new(Arc::clone(&catalog), store.clone());
     let mut server = axum_test::TestServer::builder()
         .save_cookies()
-        .build(router(state))
-        .unwrap();
+        .build(router(state));
     server.save_cookies();
 
     server

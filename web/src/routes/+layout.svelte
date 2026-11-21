@@ -1,6 +1,6 @@
 <script lang="ts">
   import '../app.css';
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
 
@@ -40,9 +40,9 @@
     </div>
     <nav class="flex flex-wrap gap-4 text-sm md:flex-col">
       {#each links as [href, label]}
-        <a href={href} class:font-semibold={$page.url.pathname === href}>{label}</a>
+        <a href={href} class:font-semibold={page.url.pathname === href}>{label}</a>
       {/each}
-      {#if $page.url.pathname === '/login'}
+      {#if page.url.pathname === '/login'}
         <a href="/login" class="font-semibold">Sign in</a>
       {:else}
         <button type="button" class="text-left" on:click={signOut}>Sign out</button>

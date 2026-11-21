@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import uPlot from 'uplot';
   import 'uplot/dist/uPlot.min.css';
-  import { request } from '$lib/api/client';
+  import { request } from '#lib/api/client.ts';
   export let query = 'up';
   export let title = query;
   export let range = '1h';

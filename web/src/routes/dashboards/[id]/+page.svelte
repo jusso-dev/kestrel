@@ -1,11 +1,11 @@
 <script lang="ts">
-  import { page } from '$app/stores';
+  import { page } from '$app/state';
   import { goto } from '$app/navigation';
-  import { request, list, type Resource } from '$lib/api/client';
-  import TimeSeries from '$lib/TimeSeries.svelte';
-  import TimeRange from '$lib/TimeRange.svelte';
-  import SingleStat from '$lib/SingleStat.svelte';
-  import Problems from '$lib/Problems.svelte';
+  import { request, list, type Resource } from '#lib/api/client.ts';
+  import TimeSeries from '#lib/TimeSeries.svelte';
+  import TimeRange from '#lib/TimeRange.svelte';
+  import SingleStat from '#lib/SingleStat.svelte';
+  import Problems from '#lib/Problems.svelte';
   type Widget = { type: 'graph' | 'stat' | 'problems'; title: string; query: string };
   type Dashboard = Resource & { layout?: Widget[] };
   let dashboards: Dashboard[] = [];
@@ -39,7 +39,7 @@
       loaded = true;
     } catch (cause) { if (current === generation) message = cause instanceof Error ? cause.message : 'Unable to load dashboard.'; }
   }
-  $: if ($page.params.id) void load($page.params.id);
+  $: if (page.params.id) void load(page.params.id);
   function add() {
     if (!title.trim() || (type !== 'problems' && !query.trim())) return;
     widgets = [...widgets, { type, title: title.trim(), query: query.trim() }];
@@ -49,8 +49,8 @@
     if (saving) return;
     saving = true;
     try {
-      const isNew = $page.params.id === 'home';
-      const saved = await request<Dashboard>('/dashboards' + (isNew ? '' : '/' + encodeURIComponent($page.params.id ?? '')), {
+      const isNew = page.params.id === 'home';
+      const saved = await request<Dashboard>('/dashboards' + (isNew ? '' : '/' + encodeURIComponent(page.params.id ?? '')), {
         method: isNew ? 'POST' : 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, layout: widgets })
       });
       if (isNew) await goto('/dashboards/' + encodeURIComponent(saved.id));

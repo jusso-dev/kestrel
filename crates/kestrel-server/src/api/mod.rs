@@ -15,7 +15,6 @@ use crate::notify::Notifier;
 use crate::otlp::{samples_from_json, samples_from_protobuf};
 use crate::promql::inject_scope;
 use crate::store::{LabelledSample, MetricStore};
-use async_trait::async_trait;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -681,7 +680,7 @@ pub fn router(state: ApiState) -> Router {
     }
     let mut router = Router::new();
     for (path, methods) in groups {
-        router = router.route(&axum_path(path), methods);
+        router = router.route(path, methods);
     }
     router
         .layer(tower_http::compression::CompressionLayer::new())
@@ -690,26 +689,6 @@ pub fn router(state: ApiState) -> Router {
             8 * 1024 * 1024,
         ))
         .with_state(state)
-}
-
-/// OpenAPI paths use `{id}`. This axum version captures with `:id`.
-fn axum_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            out.push(':');
-            for next in chars.by_ref() {
-                if next == '}' {
-                    break;
-                }
-                out.push(next);
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 fn mount(spec: &RouteSpec) -> MethodRouter<ApiState> {
@@ -878,7 +857,6 @@ fn fail(status: StatusCode, detail: impl Into<String>) -> ApiError {
 
 struct AuthUser(Principal);
 
-#[async_trait]
 impl FromRequestParts<ApiState> for AuthUser {
     type Rejection = ApiError;
 
@@ -1017,9 +995,23 @@ pub(crate) fn tenant_choices(candidates: &[LoginCandidate], matched: &[usize]) -
         .collect()
 }
 
+struct OptionalConnectInfo(Option<SocketAddr>);
+
+impl<S: Send + Sync> FromRequestParts<S> for OptionalConnectInfo {
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let addr = ConnectInfo::<SocketAddr>::from_request_parts(parts, state)
+            .await
+            .ok()
+            .map(|ConnectInfo(addr)| addr);
+        Ok(Self(addr))
+    }
+}
+
 async fn login(
     State(state): State<ApiState>,
-    connect: Option<ConnectInfo<SocketAddr>>,
+    OptionalConnectInfo(connect): OptionalConnectInfo,
     headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Result<Response, ApiError> {
@@ -1046,7 +1038,7 @@ async fn login(
         .collect::<Vec<_>>()
         .join(",");
     let source = crate::login_guard::client_ip(
-        connect.map(|ConnectInfo(addr)| addr.ip()),
+        connect.map(|addr| addr.ip()),
         Some(forwarded.as_str()).filter(|value| !value.is_empty()),
         &state.trusted_proxies,
     );
@@ -2248,8 +2240,7 @@ mod tests {
         let (state, email) = state_with(role);
         let mut server = axum_test::TestServer::builder()
             .save_cookies()
-            .build(router(state))
-            .unwrap();
+            .build(router(state));
         server.save_cookies();
         let response = server
             .post("/api/v1/login")
@@ -2285,8 +2276,7 @@ mod tests {
         assert!(audit["items"].to_string().contains("host.create"));
         let anon = axum_test::TestServer::builder()
             .save_cookies()
-            .build(router(state_with("owner").0))
-            .unwrap();
+            .build(router(state_with("owner").0));
         assert_eq!(
             anon.get("/api/v1/hosts").await.status_code(),
             StatusCode::UNAUTHORIZED
@@ -2298,7 +2288,6 @@ mod tests {
         axum_test::TestServer::builder()
             .save_cookies()
             .build(router(state).layer(axum::extract::connect_info::MockConnectInfo(addr)))
-            .unwrap()
     }
 
     #[tokio::test]
@@ -2560,8 +2549,7 @@ mod tests {
             .unwrap();
         let mut server = axum_test::TestServer::builder()
             .save_cookies()
-            .build(router(ApiState::new(catalog, store)))
-            .unwrap();
+            .build(router(ApiState::new(catalog, store)));
         server.save_cookies();
         server
             .post("/api/v1/login")

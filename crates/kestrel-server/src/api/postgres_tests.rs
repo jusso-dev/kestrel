@@ -331,7 +331,7 @@ async fn api_postgres_persists_auth_crud_templates_and_isolates_tenants() {
         .await
         .unwrap()
         .is_none());
-    let server = axum_test::TestServer::new(router(state.clone())).unwrap();
+    let server = axum_test::TestServer::new(router(state.clone()));
     let viewer=state.pg_insert(&principal,"user",json!({"email":format!("viewer-{tenant}@example.test"),"password":"password-test","role":"viewer"})).await.unwrap();
     let viewer_principal = Principal {
         user_id: Uuid::parse_str(viewer["id"].as_str().unwrap()).unwrap(),
